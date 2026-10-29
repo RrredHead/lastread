@@ -1,0 +1,31 @@
+MFT Entry Header Values:
+Entry: 65        Sequence: 1
+$LogFile Sequence Number: 0
+Allocated File
+Links: 1
+
+$STANDARD_INFORMATION Attribute Values:
+Flags: Archive
+Owner ID: 0
+Security ID: 0  ()
+Created:	2024-03-05 14:28:16.108042800 (UTC)
+File Modified:	2024-03-05 14:28:16.115531800 (UTC)
+MFT Modified:	2024-03-05 14:28:16.115531800 (UTC)
+Accessed:	2024-03-05 14:28:16.108042800 (UTC)
+
+$FILE_NAME Attribute Values:
+Flags: Archive
+Name: plain.bin
+Parent MFT Entry: 5 	Sequence: 5
+Allocated Size: 303104   	Actual Size: 0
+Created:	2024-03-05 14:28:16.108042800 (UTC)
+File Modified:	2024-03-05 14:28:16.108042800 (UTC)
+MFT Modified:	2024-03-05 14:28:16.108042800 (UTC)
+Accessed:	2024-03-05 14:28:16.108042800 (UTC)
+
+Attributes: 
+Type: $STANDARD_INFORMATION (16-0)   Name: N/A   Resident   size: 48
+Type: $FILE_NAME (48-3)   Name: N/A   Resident   size: 84
+Type: $SECURITY_DESCRIPTOR (80-1)   Name: N/A   Resident   size: 80
+Type: $DATA (128-2)   Name: N/A   Non-Resident   size: 300000  init_size: 300000
+  Starting address: 2560, length: 74  

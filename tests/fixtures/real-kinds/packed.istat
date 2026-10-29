@@ -1,0 +1,40 @@
+MFT Entry Header Values:
+Entry: 65        Sequence: 1
+$LogFile Sequence Number: 0
+Allocated File
+Links: 1
+
+$STANDARD_INFORMATION Attribute Values:
+Flags: Archive, Compressed
+Owner ID: 0
+Security ID: 0  ()
+Created:	2024-03-05 14:36:08.850089000 (UTC)
+File Modified:	2024-03-05 14:36:08.855320900 (UTC)
+MFT Modified:	2024-03-05 14:36:08.855320900 (UTC)
+Accessed:	2024-03-05 14:36:08.850089000 (UTC)
+
+$FILE_NAME Attribute Values:
+Flags: Archive, Compressed
+Name: comp.bin
+Parent MFT Entry: 64 	Sequence: 1
+Allocated Size: 36864   	Actual Size: 0
+Created:	2024-03-05 14:36:08.850089000 (UTC)
+File Modified:	2024-03-05 14:36:08.850089000 (UTC)
+MFT Modified:	2024-03-05 14:36:08.850089000 (UTC)
+Accessed:	2024-03-05 14:36:08.850089000 (UTC)
+
+Attributes: 
+Type: $STANDARD_INFORMATION (16-0)   Name: N/A   Resident   size: 48
+Type: $FILE_NAME (48-3)   Name: N/A   Resident   size: 82
+Type: $SECURITY_DESCRIPTOR (80-1)   Name: N/A   Resident   size: 80
+Type: $DATA (128-2)   Name: N/A   Non-Resident, Compressed   size: 300000  init_size: 300000
+  Starting address: 2560, length: 2  
+  Starting address: X, length: 14  Sparse
+  Starting address: 2562, length: 2  
+  Starting address: X, length: 14  Sparse
+  Starting address: 2564, length: 2  
+  Starting address: X, length: 14  Sparse
+  Starting address: 2566, length: 2  
+  Starting address: X, length: 14  Sparse
+  Starting address: 2568, length: 1  
+  Starting address: X, length: 9  Sparse

@@ -1,0 +1,32 @@
+MFT Entry Header Values:
+Entry: 66        Sequence: 1
+$LogFile Sequence Number: 0
+Allocated File
+Links: 1
+
+$STANDARD_INFORMATION Attribute Values:
+Flags: Archive, Sparse
+Owner ID: 0
+Security ID: 0  ()
+Created:	2024-03-05 14:28:16.117182700 (UTC)
+File Modified:	2024-03-05 14:28:16.117954600 (UTC)
+MFT Modified:	2024-03-05 14:28:16.117954600 (UTC)
+Accessed:	2024-03-05 14:28:16.117182700 (UTC)
+
+$FILE_NAME Attribute Values:
+Flags: Archive
+Name: sparse.bin
+Parent MFT Entry: 5 	Sequence: 5
+Allocated Size: 40960   	Actual Size: 0
+Created:	2024-03-05 14:28:16.117182700 (UTC)
+File Modified:	2024-03-05 14:28:16.117182700 (UTC)
+MFT Modified:	2024-03-05 14:28:16.117182700 (UTC)
+Accessed:	2024-03-05 14:28:16.117182700 (UTC)
+
+Attributes: 
+Type: $STANDARD_INFORMATION (16-0)   Name: N/A   Resident   size: 48
+Type: $FILE_NAME (48-3)   Name: N/A   Resident   size: 86
+Type: $SECURITY_DESCRIPTOR (80-1)   Name: N/A   Resident   size: 80
+Type: $DATA (128-2)   Name: N/A   Non-Resident, Sparse   size: 204800  init_size: 204800
+  Starting address: X, length: 40  Sparse
+  Starting address: 2634, length: 10  

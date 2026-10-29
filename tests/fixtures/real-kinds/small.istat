@@ -1,0 +1,30 @@
+MFT Entry Header Values:
+Entry: 64        Sequence: 1
+$LogFile Sequence Number: 0
+Allocated File
+Links: 1
+
+$STANDARD_INFORMATION Attribute Values:
+Flags: Archive
+Owner ID: 0
+Security ID: 0  ()
+Created:	2024-03-05 14:28:16.106801400 (UTC)
+File Modified:	2024-03-05 14:28:16.107481200 (UTC)
+MFT Modified:	2024-03-05 14:28:16.107481200 (UTC)
+Accessed:	2024-03-05 14:28:16.106801400 (UTC)
+
+$FILE_NAME Attribute Values:
+Flags: Archive
+Name: small.txt
+Parent MFT Entry: 5 	Sequence: 5
+Allocated Size: 16   	Actual Size: 0
+Created:	2024-03-05 14:28:16.106801400 (UTC)
+File Modified:	2024-03-05 14:28:16.106801400 (UTC)
+MFT Modified:	2024-03-05 14:28:16.106801400 (UTC)
+Accessed:	2024-03-05 14:28:16.106801400 (UTC)
+
+Attributes: 
+Type: $STANDARD_INFORMATION (16-0)   Name: N/A   Resident   size: 48
+Type: $FILE_NAME (48-3)   Name: N/A   Resident   size: 84
+Type: $SECURITY_DESCRIPTOR (80-1)   Name: N/A   Resident   size: 80
+Type: $DATA (128-2)   Name: N/A   Resident   size: 15
