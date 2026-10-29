@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-unit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck gddrescue jq sleuthkit gawk
+      - name: Lint (ShellCheck and style rules)
+        run: tests/lint.sh
+      - name: Unit tests with mawk (the default awk of Ubuntu)
+        run: |
+          sudo update-alternatives --set awk /usr/bin/mawk
+          tests/unit/run.sh
+      - name: Unit tests with gawk
+        run: |
+          sudo update-alternatives --set awk /usr/bin/gawk
+          tests/unit/run.sh
+
+  # The integration tests create loop and device-mapper devices and mount NTFS through FUSE.
+  # A hosted runner may not allow all of that (scsi_debug needs linux-modules-extra and is skipped
+  # when missing). The job does not block merges: if it cannot run here, run the same tests in a VM
+  # with tests/vm.sh (see the README).
+  integration:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs smartmontools whiptail
+          sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra: scsi_debug tests will be skipped"
+      - name: Integration tests
+        run: sudo tests/integration/run.sh
