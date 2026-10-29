@@ -1,0 +1,1608 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 The lastread authors
+#
+# This program is free software: you can redistribute it and/or modify it under the terms of the
+# GNU General Public License as published by the Free Software Foundation, either version 3 of the
+# License, or (at your option) any later version. It is distributed in the hope that it will be
+# useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details. You should have
+# received a copy of it along with this program; if not, see <https://www.gnu.org/licenses/>.
+#
+# lastread — image a failing disk with GNU ddrescue without killing it, and recover files from
+# the image. The failing disk is only ever read.
+#
+# What it adds on top of plain ddrescue:
+#   * phases picked from the ddrescue map, so any stop (overheating, Ctrl+C, the disk dropping off
+#     the bus, a reboot) is followed by a plain re-run that continues where it stopped;
+#   * a watchdog: temperature (smartctl) and the device itself are checked every --interval seconds;
+#   * "deferred zones": places where the disk hangs are set aside and read last, from both ends;
+#   * a dropped disk is detected, ddrescue is stopped before it marks the rest as bad, and the disk
+#     is brought back by rescanning its SCSI host when the transport allows it;
+#   * a file level (NTFS, The Sleuth Kit, no mounting): which files are intact, which are damaged,
+#     targeted recovery of chosen files, extraction of intact files, detection of silent garbage.
+# See README.md and docs/how-it-works.md; `lastread --help` lists every option.
+set -Eeuo pipefail
+# One locale for all parsing (tool output, number formats, sort order, binary grep).
+export LC_ALL=C
+
+VERSION=0.1.0
+PROG=lastread
+
+# --- Defaults (every one can be changed by an option) --------------------------------------------
+
+source_arg="" name="" dir=.
+stop=48 resume=44 interval=60
+min_rate="" skip_size="" retries=3 reverse=0 start_at="" add_zones=() give_up=0
+rescan=1 rescan_pause=60 rescan_attempts=3 kernel_timeout=180
+zone_margin=$((1000 * 1000 * 1000))     # a hang defers this much on each side of the hang position
+zone_min_progress=$((16 * 1024 * 1024)) # an attempt narrowing a zone by less is a failure; two in a row = core
+artifact_limit=$((1000 * 1000 * 1000))  # more "dropped disk" traces than this are reverted
+artifact_bad=$((16 * 1024 * 1024))      # a "bad" area larger than this in one piece is a trace, not a bad spot
+temp_cmd=${LASTREAD_TEMP_CMD:-} smart_type="" no_temp=0
+extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
+extract_to="" includes=() maps=() owner="" file_mode=0664 dir_mode=0775
+suspect_patterns=() suspect_zeros=$((128 * 1024)) suspect_check=1
+DRY_RUN=0
+
+# Observed on a real failing 2.5" SMR drive: service sectors with the tag "sEDU" at the start and
+# at the end of a 512-byte sector were returned instead of data, with no read error.
+DEFAULT_SUSPECT_RE='sEDU\x00{504}sEDU'
+
+# --- State ---------------------------------------------------------------------------------------
+
+SECTOR=512 PART_SIZE=0 CLUSTER=0
+dev="" parent="" whole="" SCSI_HOST="" TRANSPORT="" timeout_file=""
+img="" map="" logs="" zones="" domain="" LOG="" RATES=""
+TMPD="" DD_PID="" INHIBIT_PID="" orig_timeout=""
+TEMP_GUARD=1 SMART_ARGS=()
+TARGET_RANGES=""
+# Set by image_prepare: ok | skipped (no file level for this image) | missing (no Sleuth Kit)
+FS_STATE=""
+RUN_AS=() SUSPECT_RE=""
+recoveries=0
+ZS="" ZE="" ZD=""
+C_RED="" C_YELLOW="" C_BOLD="" C_RESET=""
+
+# --- Messages ------------------------------------------------------------------------------------
+
+log() { printf '%s\n' "$*"; }
+info() { printf '%s %s%s%s\n' "$(date '+%H:%M:%S')" "$C_BOLD" "$*" "$C_RESET"; }
+warn() { printf '%s %swarning:%s %s\n' "$(date '+%H:%M:%S')" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die() {
+  printf '%s %serror:%s %s\n' "$(date '+%H:%M:%S')" "$C_RED" "$C_RESET" "$*" >&2
+  exit 1
+}
+# Message to the screen and to the run log (once the log directory exists).
+note() {
+  info "$*"
+  [[ -z $logs || ! -d $logs ]] || printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"
+}
+on_err() {
+  printf '%s %serror:%s command "%s" failed with exit code %s (line %s)\n' \
+    "$(date '+%H:%M:%S')" "$C_RED" "$C_RESET" "$2" "$1" "$3" >&2
+}
+
+usage() {
+  cat <<EOF
+Usage: sudo $PROG SOURCE [options]
+       sudo $PROG --inventory [--name NAME] [options]
+
+Images the disk or partition SOURCE with GNU ddrescue while watching its temperature and its
+presence on the bus, finds the files touched by unreadable areas and (optionally) extracts the
+intact ones. Re-running the same command continues where the previous run stopped.
+
+SOURCE is a block device. Prefer a stable name such as /dev/disk/by-id/ata-...-part1: the name
+sdX can change when a dropped disk is brought back. SOURCE is only read.
+
+Files and layout:
+  --dir DIR            directory for NAME.img, NAME.map and NAME.logs/ [current directory];
+                       must exist and must not be on the failing disk
+  --name NAME          base name of the image files [base name of SOURCE]
+
+Watchdog:
+  --stop C             stop ddrescue at this temperature, °C [48]
+  --resume C           continue at this temperature or lower, °C [44]
+  --interval SEC       how often to check temperature and the device [60]
+  --temp-cmd PROGRAM   read the temperature from PROGRAM instead of smartctl: it is run with the
+                       whole-disk device as its only argument and prints °C (no shell involved;
+                       default from \$LASTREAD_TEMP_CMD). Useful for tests and odd sensors.
+  --smart-type TYPE    smartctl -d TYPE (for example sat for a SATA disk behind a USB bridge);
+                       by default plain smartctl is tried first, then -d sat
+  --no-temp            do not watch the temperature at all
+                       (without any working temperature source the tool warns and runs unwatched)
+
+Reading (copy phase):
+  --min-rate RATE      defer places that read slower than this (ddrescue -a), for example 20M
+  --skip-size SIZE     first jump after an error or slow read, doubling afterwards (ddrescue -K),
+                       for example 1Mi or 1Mi,1Gi with a ceiling [64Ki]
+  --retries N          passes over unreadable sectors in the retry phase [3]
+  --reverse            read the copy phase from the end of the device to the start
+  --start-at POS       start the first copy run here, for example 1700G (k/M/G/T are powers of
+                       1000, Ki/Mi/Gi/Ti powers of 1024); what was skipped is read in later passes
+
+Deferred zones (places where the disk hangs):
+  --add-zone FROM-TO   defer a zone by hand, for example 511G-521G; added once: later runs do not
+                       add the same zone again (it would widen a zone that has been narrowed)
+  --give-up-zones      give up the deferred zones that the disk does not read: files inside are
+                       reported as damaged
+  --zone-margin SIZE   a hang defers this much on each side of the hang position [1G]
+  --zone-min-progress SIZE
+                       an attempt that narrows a zone by less than this failed; two failures in a
+                       row make the zone a core the disk does not read [16Mi]
+
+Dropped disk:
+  --rescan-pause SEC   pause before rescanning the SCSI host of a dropped disk [60]
+  --rescan-attempts N  returns in a row without progress before asking for a power cycle [3]
+  --no-rescan          do not bring the disk back by rescanning; ask for a power cycle at once
+  --kernel-timeout SEC command timeout of the kernel for the disk while rescuing, restored on exit;
+                       0 leaves it alone [180]
+  --artifact-limit SIZE
+                       more than this much "dropped disk" traces in the map are reverted [1G]
+  --artifact-bad SIZE  a bad area larger than this in one piece counts as a trace [16Mi]
+
+File level (NTFS only; needs The Sleuth Kit; the image is never mounted):
+  --extract            extract the intact files from the image (needs --extract-to)
+  --extract-damaged    in a normal run, extract the damaged files too (their unreadable parts are
+                       zeros); a later run skips such a file because size and time match, so
+                       delete it before recovering it again
+  --extract-to DIR     where to extract; the tree of the volume is preserved
+  --include PREFIX     extract only this path (a directory or a file) of the volume; repeatable
+  --map SRC:DST        extract the volume path SRC (a directory or a file) into the directory DST
+                       below --extract-to; repeatable. With --include or --map only the matching
+                       files are extracted. With --inventory they only select the paths whose
+                       counts are printed. Without them the whole volume is extracted,
+                       system folders and swap files included.
+  --owner USER[:GROUP] owner of extracted files [\$SUDO_USER, else root]
+  --file-mode MODE     mode of extracted files [0664]
+  --dir-mode MODE      mode of directories created by extraction [0775]
+  --inventory          without the disk: lists of intact and incomplete files from the image, at
+                       any stage of the rescue (with --extract: extract only the intact ones)
+  --pick               targeted recovery: choose incomplete files in a window and read only them
+  --file PART          targeted recovery without questions: incomplete files whose path contains
+                       PART; repeatable
+  --no-fs              imaging only: no file level at all
+
+Silent garbage (the disk answered without an error, but with something else than data):
+  --suspect-pattern RE a grep -P pattern (bytes, LC_ALL=C); files whose data matches are listed
+                       as suspicious. Repeatable; replaces the built-in pattern
+                       'sEDU\\x00{504}sEDU' (a service sector seen on a failing SMR drive)
+  --suspect-zeros SIZE a run of zeros this long counts as garbage; 0 turns the check off [128Ki]
+  --no-suspect-check   do not check the data at all
+
+General:
+  --dry-run            show the state and what would be done, run nothing
+  -h, --help           this text
+  --version            print the version
+
+Exit status: 0 done, 1 error, 2 only stuck deferred zones are left (see --give-up-zones),
+130 interrupted (the next run continues).
+EOF
+}
+
+# --- Small helpers -------------------------------------------------------------------------------
+
+# Bytes from "1700G" (k/M/G/T are powers of 1000), "1Mi" (powers of 1024) or plain digits.
+parse_size() {
+  local v=${1/%k/K} out
+  out="$(numfmt --from=auto -- "$v" 2>/dev/null)" || return 1
+  [[ $out =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$out"
+}
+# A size for messages: GB for real disks, MB below 100 MB (test images).
+gb() { awk -v b="$1" 'BEGIN { if (b >= 1e8) printf "%.1f GB", b / 1e9; else printf "%.1f MB", b / 1e6 }'; }
+need_number() {
+  local opt=$1 v=$2
+  [[ $v =~ ^[0-9]+$ ]] || die "$opt: not a number: $v"
+}
+# Converts the size in the variable named VAR to bytes, in place.
+size_option() {
+  local -n ref=$1
+  local out
+  out="$(parse_size "$ref")" || die "$2: not a size: $ref (examples: 100M, 1Gi)"
+  ref=$out
+}
+
+# --- Arguments -----------------------------------------------------------------------------------
+
+parse_args() {
+  while (($#)); do
+    case $1 in
+      --dir | --name | --stop | --resume | --interval | --temp-cmd | --smart-type | --min-rate | --skip-size | \
+        --retries | --start-at | --add-zone | --rescan-pause | --rescan-attempts | \
+        --kernel-timeout | --zone-margin | --zone-min-progress | --artifact-limit | --artifact-bad | \
+        --extract-to | --include | --map | --owner | --file-mode | --dir-mode | --file | \
+        --suspect-pattern | --suspect-zeros)
+        [[ -n ${2:-} ]] || die "$1: a value is required (see --help)"
+        case $1 in
+          --dir) dir=$2 ;;
+          --name) name=$2 ;;
+          --stop) stop=$2 ;;
+          --resume) resume=$2 ;;
+          --interval) interval=$2 ;;
+          --temp-cmd) temp_cmd=$2 ;;
+          --smart-type) smart_type=$2 ;;
+          --min-rate) min_rate=$2 ;;
+          --skip-size) skip_size=$2 ;;
+          --retries) retries=$2 ;;
+          --start-at) start_at=$2 ;;
+          --add-zone) add_zones+=("$2") ;;
+          --rescan-pause) rescan_pause=$2 ;;
+          --rescan-attempts) rescan_attempts=$2 ;;
+          --kernel-timeout) kernel_timeout=$2 ;;
+          --zone-margin) zone_margin=$2 ;;
+          --zone-min-progress) zone_min_progress=$2 ;;
+          --artifact-limit) artifact_limit=$2 ;;
+          --artifact-bad) artifact_bad=$2 ;;
+          --extract-to) extract_to=$2 ;;
+          --include) includes+=("$2") ;;
+          --map) maps+=("$2") ;;
+          --owner) owner=$2 ;;
+          --file-mode) file_mode=$2 ;;
+          --dir-mode) dir_mode=$2 ;;
+          --file) file_patterns+=("$2") ;;
+          --suspect-pattern) suspect_patterns+=("$2") ;;
+          --suspect-zeros) suspect_zeros=$2 ;;
+        esac
+        shift
+        ;;
+      --extract) extract=1 ;;
+      --extract-damaged) extract_damaged=1 ;;
+      --reverse) reverse=1 ;;
+      --give-up-zones) give_up=1 ;;
+      --inventory) inventory=1 ;;
+      --pick) pick=1 ;;
+      --no-rescan) rescan=0 ;;
+      --no-temp) no_temp=1 ;;
+      --no-fs) no_fs=1 ;;
+      --no-suspect-check) suspect_check=0 ;;
+      --dry-run) DRY_RUN=1 ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      --version)
+        printf '%s %s\n' "$PROG" "$VERSION"
+        exit 0
+        ;;
+      -*) die "unknown option: $1 (see --help)" ;;
+      *)
+        [[ -z $source_arg ]] || die "unexpected argument: $1 (see --help)"
+        source_arg=$1
+        ;;
+    esac
+    shift
+  done
+}
+
+# Checks values, converts sizes to bytes, normalises include/map prefixes. Needs no device.
+validate_args() {
+  local n m size_re='[0-9]+([sbkMGTPEZYRQ]i?)?'
+  need_number --stop "$stop"
+  need_number --resume "$resume"
+  need_number --interval "$interval"
+  need_number --retries "$retries"
+  need_number --rescan-pause "$rescan_pause"
+  need_number --rescan-attempts "$rescan_attempts"
+  need_number --kernel-timeout "$kernel_timeout"
+  # decimal even with a leading zero (08 is not an octal number here)
+  stop=$((10#$stop)) resume=$((10#$resume)) interval=$((10#$interval)) retries=$((10#$retries))
+  rescan_pause=$((10#$rescan_pause)) rescan_attempts=$((10#$rescan_attempts)) kernel_timeout=$((10#$kernel_timeout))
+  # no returns at all is the same as --no-rescan
+  ((rescan_attempts > 0)) || rescan=0
+  ((interval > 0)) || die "--interval must be at least 1"
+  ((resume < stop)) || die "--resume ($resume) must be lower than --stop ($stop)"
+  [[ -z $skip_size || $skip_size =~ ^${size_re}(,${size_re})?$ ]] ||
+    die "--skip-size: a size like 1Mi or 1Mi,1Gi, not \"$skip_size\""
+  size_option zone_margin --zone-margin
+  size_option zone_min_progress --zone-min-progress
+  size_option artifact_limit --artifact-limit
+  size_option artifact_bad --artifact-bad
+  size_option suspect_zeros --suspect-zeros
+  [[ $file_mode =~ ^[0-7]{3,4}$ ]] || die "--file-mode: an octal mode like 0664, not \"$file_mode\""
+  [[ $dir_mode =~ ^[0-7]{3,4}$ ]] || die "--dir-mode: an octal mode like 0775, not \"$dir_mode\""
+  ((!no_fs)) || ! ((extract || inventory || pick || ${#file_patterns[@]})) ||
+    die "--no-fs cannot be combined with --extract, --inventory, --pick or --file"
+  ((!inventory)) || ! ((pick || ${#file_patterns[@]})) ||
+    die "--inventory cannot be combined with --pick or --file"
+  ((!extract_damaged)) || ((extract)) || die "--extract-damaged needs --extract"
+  ((!extract_damaged)) || ! ((inventory || pick || ${#file_patterns[@]})) ||
+    die "--extract-damaged only applies to a normal run, not to --inventory, --pick or --file"
+  if ((extract)); then
+    [[ -n $extract_to ]] || die "--extract needs --extract-to DIR"
+  elif [[ -n $extract_to || -n $owner ]]; then
+    die "--extract-to and --owner only make sense with --extract"
+  fi
+  ((${#includes[@]} + ${#maps[@]} == 0)) || ((extract || inventory)) ||
+    die "--include and --map only make sense with --extract or --inventory"
+  local i
+  for i in "${!includes[@]}"; do
+    n="${includes[i]#/}"
+    includes[i]="${n%/}"
+    [[ -n ${includes[i]} ]] || die "--include: an empty path"
+  done
+  for i in "${!maps[@]}"; do
+    m=${maps[i]}
+    [[ $m == ?*:?* ]] || die "--map: expected SRC:DST, not \"$m\""
+    local src="${m%%:*}" dst="${m#*:}"
+    src="${src#/}"
+    src="${src%/}"
+    dst="${dst#/}"
+    dst="${dst%/}"
+    [[ $dst != . ]] || dst=""
+    [[ -n $src ]] || die "--map: an empty source in \"$m\""
+    [[ "/$dst/" != *"/../"* ]] || die "--map: \"..\" is not allowed in the destination \"$m\""
+    maps[i]="$src:$dst"
+  done
+  if [[ -n $start_at ]]; then
+    start_at="$(parse_size "$start_at")" || die "--start-at: cannot parse the position (example: 1700G)"
+  fi
+  local z zfrom zto
+  for z in "${add_zones[@]}"; do
+    [[ $z == ?*-?* ]] || die "--add-zone: expected FROM-TO, for example 511G-521G"
+    zfrom="$(parse_size "${z%%-*}")" || die "--add-zone: cannot parse \"$z\""
+    zto="$(parse_size "${z#*-}")" || die "--add-zone: cannot parse \"$z\""
+    ((zfrom < zto)) || die "--add-zone: FROM must be lower than TO in \"$z\""
+  done
+  # Silent-garbage pattern: user patterns replace the built-in one; zeros are added if requested.
+  # PCRE allows a repeat count of at most 65535, hence the nested form for long runs of zeros.
+  local -a parts=()
+  if ((suspect_check)); then
+    if ((${#suspect_patterns[@]})); then
+      for n in "${suspect_patterns[@]}"; do parts+=("(?:$n)"); done
+    else
+      parts+=("$DEFAULT_SUSPECT_RE")
+    fi
+    if ((suspect_zeros > 0)); then
+      local q=$((suspect_zeros / 32768)) r=$((suspect_zeros % 32768)) z_re=""
+      ((q <= 65535)) || die "--suspect-zeros: too large"
+      ((q == 0)) || z_re="(?:\\x00{32768}){$q}"
+      ((r == 0)) || z_re+="\\x00{$r}"
+      parts+=("$z_re")
+    fi
+  fi
+  SUSPECT_RE=""
+  for n in "${parts[@]}"; do SUSPECT_RE+="${SUSPECT_RE:+|}$n"; done
+  if [[ -n $SUSPECT_RE ]]; then
+    # grep exits with 2 on an invalid pattern (1 is "no match"): better to learn it now than at the
+    # first extracted file, days into a rescue.
+    n=0
+    grep -aP -- "$SUSPECT_RE" </dev/null >/dev/null 2>&1 || n=$?
+    ((n != 2)) || die "the data-check pattern is not a valid grep -P pattern (--suspect-pattern / --suspect-zeros): $SUSPECT_RE"
+  fi
+}
+
+# --- Device --------------------------------------------------------------------------------------
+
+# Device facts from SOURCE: kernel name, whole disk, SCSI host, transport. Called again after
+# every return of a dropped disk, because the name can change.
+resolve_device() {
+  dev="$(readlink -f "$source_arg")"
+  parent="$(lsblk -no PKNAME "$dev" 2>/dev/null | head -1)" || parent=""
+  parent="${parent:-$(basename "$dev")}"
+  whole="/dev/$parent"
+  SCSI_HOST="$(readlink -f "/sys/block/$parent/device" 2>/dev/null | grep -o 'host[0-9]*' | tail -1)" || SCSI_HOST=""
+  timeout_file="/sys/block/$parent/device/timeout"
+  TRANSPORT="$(lsblk -dno TRAN "$whole" 2>/dev/null | head -1 | tr -d ' ')" || TRANSPORT=""
+  SECTOR="$(blockdev --getss "$dev" 2>/dev/null)" || SECTOR=512
+}
+# Why a host rescan cannot bring this disk back; empty if it can. Rescanning a SCSI host re-polls
+# the ports of a libata (SATA) or SAS host. It cannot revive a USB device (the USB layer has
+# dropped it) or an NVMe controller.
+rescan_unavailable_reason() {
+  [[ -n $SCSI_HOST ]] || {
+    printf 'the device has no SCSI host in sysfs'
+    return 0
+  }
+  case $TRANSPORT in
+    "" | sata | ata | sas) ;;
+    *) printf 'transport "%s" is not rescannable' "$TRANSPORT" ;;
+  esac
+}
+# "- - -" into the scan file of the SCSI host makes the kernel poll the port again. Waits until the
+# device path appears.
+rescan_host() {
+  local host=$1 i
+  [[ -n $host && -w /sys/class/scsi_host/$host/scan ]] || return 1
+  echo "- - -" >"/sys/class/scsi_host/$host/scan" 2>/dev/null || true
+  udevadm settle -t 60 2>/dev/null || true
+  for i in $(seq 1 30); do
+    [[ ! -b $source_arg ]] || return 0
+    sleep 2
+  done
+  return 1
+}
+
+# --- Journal -------------------------------------------------------------------------------------
+
+# ddrescuelog prints with the locale of the process; LC_ALL=C is set for the whole script.
+status_short() {
+  [[ -f $map ]] || {
+    printf 'no map yet'
+    return 0
+  }
+  local st
+  st="$(ddrescuelog -t "$map")"
+  printf 'rescued %s, unreadable %s' \
+    "$(sed -n 's/^ *rescued: *\([^,]*\),.*( *\([0-9.]*%\)).*/\1 (\2)/p' <<<"$st")" \
+    "$(sed -n 's/^ *bad-sector: *\([^,]*\),.*/\1/p' <<<"$st")"
+}
+summary() {
+  [[ -f $map ]] || return 0
+  ddrescuelog -t "$map" | tee -a "$LOG"
+}
+zones_text() {
+  local s e _
+  while read -r s e _; do printf '%s – %s; ' "$(gb "$s")" "$(gb "$e")"; done <"$zones"
+}
+
+# --- Disk and temperature ------------------------------------------------------------------------
+
+# Prints the temperature in whole °C; fails if there is none.
+temperature() {
+  local out t
+  ((TEMP_GUARD)) || return 1
+  if [[ -n $temp_cmd ]]; then
+    out="$(timeout 30 "$temp_cmd" "$whole")" || return 1
+  else
+    # smartctl's exit status is a bit mask that also reports a worn disk, so it is ignored: the
+    # JSON either has the temperature or it does not.
+    out="$(timeout 30 smartctl -j -A "${SMART_ARGS[@]}" "$whole" 2>/dev/null || true)"
+    out="$(jq -er '.temperature.current' <<<"$out" 2>/dev/null)" || return 1
+  fi
+  t="${out%%.*}"
+  [[ $t =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$((10#$t))"
+}
+# Chooses the temperature source once: --temp-cmd, smartctl, smartctl -d sat. Without any, the
+# tool runs without the watchdog (and says so).
+detect_temperature_source() {
+  local t type
+  TEMP_GUARD=1 SMART_ARGS=()
+  if ((no_temp)); then
+    TEMP_GUARD=0
+    warn "temperature is not watched (--no-temp)"
+    return 0
+  fi
+  if [[ -n $temp_cmd ]]; then
+    t="$(temperature)" || t=""
+    [[ -n $t ]] || {
+      TEMP_GUARD=0
+      warn "--temp-cmd gave no temperature: running without the temperature watchdog"
+      return 0
+    }
+    info "temperature from $temp_cmd: $t °C"
+    return 0
+  fi
+  if ! command -v smartctl >/dev/null || ! command -v jq >/dev/null; then
+    TEMP_GUARD=0
+    warn "smartctl or jq is missing: running without the temperature watchdog (apt install smartmontools jq)"
+    return 0
+  fi
+  local -a candidates=("${smart_type:-}")
+  [[ -n $smart_type ]] || candidates+=(sat)
+  for type in "${candidates[@]}"; do
+    SMART_ARGS=()
+    [[ -z $type ]] || SMART_ARGS=(-d "$type")
+    t="$(temperature)" || t=""
+    if [[ -n $t ]]; then
+      info "temperature from smartctl${type:+ (-d $type)}: $t °C"
+      return 0
+    fi
+  done
+  SMART_ARGS=()
+  TEMP_GUARD=0
+  warn "no temperature from smartctl for $whole: running without the temperature watchdog (try --smart-type, --temp-cmd or --no-temp)"
+}
+# The device is alive: sysfs state is "running" and one block can be read directly.
+device_ok() {
+  local state="/sys/block/$parent/device/state"
+  [[ ! -r $state || "$(cat "$state")" == running ]] || return 1
+  timeout 300 dd if="$dev" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null
+}
+die_device() {
+  local why=""
+  if ((!rescan)); then
+    why=" (rescanning is off)"
+  elif [[ -n "$(rescan_unavailable_reason)" ]]; then
+    why=" (automatic return is not available: $(rescan_unavailable_reason))"
+  else
+    why=" and rescanning did not bring it back"
+  fi
+  die "the disk does not answer ($dev)$why. Power the machine fully off, switch it on and run the same command again: it continues where it stopped"
+}
+# Brings a dropped disk back without a power cycle: pause, rescan of the SCSI host, wait for the
+# device, then the usual direct read. At most rescan_attempts times in a row without progress.
+recover_device() {
+  local why
+  ((rescan)) || return 1
+  why="$(rescan_unavailable_reason)"
+  if [[ -n $why ]]; then
+    note "cannot bring the disk back by rescanning: $why"
+    return 1
+  fi
+  recoveries=$((recoveries + 1))
+  if ((recoveries > rescan_attempts)); then
+    note "the disk keeps dropping: $rescan_attempts returns in a row without progress"
+    return 1
+  fi
+  note "the disk dropped — rescanning $SCSI_HOST in ${rescan_pause}s (attempt $recoveries of $rescan_attempts)"
+  sleep "$rescan_pause"
+  rescan_host "$SCSI_HOST" || return 1
+  resolve_device
+  ((kernel_timeout == 0)) || [[ ! -w $timeout_file ]] || echo "$kernel_timeout" >"$timeout_file"
+  device_ok || return 1
+  note "the disk is back: $dev"
+}
+wait_cool() {
+  local t last=-1000
+  while :; do
+    t="$(temperature)" || t=""
+    if [[ -z $t ]]; then
+      warn "temperature unavailable — pausing for 5 minutes"
+      sleep 300
+      return 0
+    fi
+    if ((t <= resume)); then
+      note "temperature $t °C — continuing"
+      return 0
+    fi
+    if ((SECONDS - last >= 300)); then
+      note "cooling down: $t °C, continuing at $resume °C"
+      last=$SECONDS
+    fi
+    sleep "$interval"
+  done
+}
+
+# --- Traces of a dropped disk ----------------------------------------------------------------------
+
+# Bytes in traces: non-trimmed, non-scraped and "bad" areas larger than artifact_bad.
+artifact_bytes() {
+  local pos size st total=0
+  [[ -f $map ]] || {
+    echo 0
+    return 0
+  }
+  while read -r pos size st; do
+    if [[ $st == [*/] ]] || { [[ $st == - ]] && ((size > artifact_bad)); }; then total=$((total + size)); fi
+  done < <(awk '!/^#/ && ++n > 1' "$map")
+  echo "$total"
+}
+# Returns traces to "not tried": ddrescue then reads them again the normal way, not sector by
+# sector. The previous map is kept next to it (.before-revert).
+revert_artifacts() {
+  local line pos size st n=0
+  [[ ! -e $map.before-revert ]] || mv -f "$map.before-revert" "$map.before-revert.prev"
+  cp -p "$map" "$map.before-revert"
+  while IFS= read -r line; do
+    if [[ $line != \#* ]] && ((++n > 1)); then
+      read -r pos size st <<<"$line"
+      if [[ $st == [*/] ]] || { [[ $st == - ]] && ((size > artifact_bad)); }; then line="$pos  $size  ?"; fi
+    fi
+    printf '%s\n' "$line"
+  done <"$map" >"$map.new"
+  mv "$map.new" "$map"
+  note "traces of the dropped disk returned to \"not tried\": $(status_short)"
+}
+
+# --- Deferred zones ------------------------------------------------------------------------------
+
+# A zone is a line "START END DIRECTION FAILURES" (bytes; f — the next attempt reads from the
+# start of the zone, r — from the end; failures — hangs in a row with too little progress).
+zones_exist() { [[ -s $zones ]]; }
+zones_abandoned() { [[ -e $logs/zones.abandoned ]]; }
+# Adds the zone [FROM, TO) and merges overlapping ones (a merged zone starts over).
+zone_put() {
+  local start=$1 end=$2
+  start=$((start / SECTOR * SECTOR))
+  end=$(((end < PART_SIZE ? end : PART_SIZE) / SECTOR * SECTOR))
+  { [[ ! -f $zones ]] || cat "$zones"; printf '%s %s f 0\n' "$start" "$end"; } | sort -n |
+    awk '{ if (n && $1 <= e) { if ($2 > e) e = $2; d = "f"; k = 0 }
+           else { if (n) print s, e, d, k; s = $1; e = $2; d = $3; k = $4; n = 1 } }
+         END { if (n) print s, e, d, k }' >"$zones.new"
+  mv "$zones.new" "$zones"
+}
+# The next zone for the zones phase: the first one where progress is still possible.
+zone_next() { awk '$4 < 2 {print; exit}' "$zones"; }
+# Bounds of what is still unread in [S, E) according to the map: the first start and the last end
+# of blocks ?, * and /. Unreadable sectors (-) do not count — the retry phase rechecks them.
+# Prints "START END"; "E E" if nothing is unread.
+unrescued_span() {
+  local zs=$1 ze=$2 pos size st b0 b1 first="" last=""
+  while read -r pos size st; do
+    b0=$((pos)) b1=$((pos + size))
+    ((b1 > zs)) || continue
+    ((b0 < ze)) || break
+    [[ $st == [?*/] ]] || continue
+    [[ -n $first ]] || first=$((b0 > zs ? b0 : zs))
+    last=$((b1 < ze ? b1 : ze))
+  done < <(awk '!/^#/ && ++n > 1' "$map")
+  printf '%s %s\n' "${first:-$ze}" "${last:-$ze}"
+}
+# The disk hung near P. In the zones phase the current zone narrows by exactly what was rescued
+# (by the map, not by the rate log: its granularity is coarse and that looped forever), from the
+# side the reading came from. In other phases a new zone ±zone_margin is deferred around P.
+zone_hang() {
+  local p=$1 phase=$2 s e d k msg="" first last
+  if [[ $phase == zones && -n $ZS ]]; then
+    read -r first last < <(unrescued_span "$ZS" "$ZE")
+    while read -r s e d k; do
+      if [[ $s == "$ZS" && $e == "$ZE" ]]; then
+        if [[ $ZD == f ]]; then s=$((first / SECTOR * SECTOR)); else e=$(((last + SECTOR - 1) / SECTOR * SECTOR)); fi
+        if ((e <= s)); then
+          # stdout of this loop is the new zone list: the message must not go there.
+          note "deferred zone $(gb "$ZS") – $(gb "$ZE") is fully read" >&2
+          continue
+        fi
+        if (((ZE - ZS) - (e - s) < zone_min_progress)); then k=$((k + 1)); else k=0; fi
+        if [[ $ZD == f ]]; then d=r; else d=f; fi
+        msg="the disk hung in a deferred zone near $(gb "$p"); the zone is now $(gb "$s") – $(gb "$e")"
+        ((k == 0)) || msg+=", almost no progress ($k of 2)"
+      fi
+      printf '%s %s %s %s\n' "$s" "$e" "$d" "$k"
+    done <"$zones" >"$zones.new"
+    mv "$zones.new" "$zones"
+    [[ -s $zones ]] || rm -f "$zones"
+    [[ -z $msg ]] || note "$msg"
+  else
+    zone_put "$((p > zone_margin ? p - zone_margin : 0))" "$((p + zone_margin))"
+    note "the disk hung near $(gb "$p"): deferred zones — $(zones_text)"
+  fi
+}
+# Where ddrescue will start reading: the position in the status line of the map. Without this it
+# continues from where it stopped — the hang position, not the edge of the zone.
+set_map_pos() {
+  local line n=0
+  while IFS= read -r line; do
+    if [[ $line != \#* ]] && ((++n == 1)); then line="$(printf '0x%X  ?  1' "$1")"; fi
+    printf '%s\n' "$line"
+  done <"$map" >"$map.new"
+  mv "$map.new" "$map"
+}
+map_pos() { awk '!/^#/ {print $1; exit}' "$map"; }
+# Where the disk hung: the last position with a non-zero rate in the rate log of the run.
+# (ddrescue buffers the rate log and writes it on exit, so call this after the run.)
+hang_position() {
+  [[ -f $1 ]] || return 0
+  awk '!/^#/ && NF >= 3 { if (first == "") first = $2; if ($3 > 0) last = $2 }
+       END { print (last != "" ? last : first) }' "$1"
+}
+# The ddrescue domain (-m). "outside": everything except the zones; otherwise only the zone
+# [START, END).
+write_domain() {
+  local pos=0 s e _ zin='?' zout='+'
+  {
+    printf '# %s: ddrescue domain\n0x00000000  +  1\n' "$PROG"
+    if [[ $1 == outside ]]; then
+      while read -r s e _; do
+        ((s <= pos)) || printf '0x%X  0x%X  %s\n' "$pos" "$((s - pos))" "$zout"
+        printf '0x%X  0x%X  %s\n' "$s" "$((e - s))" "$zin"
+        pos=$e
+      done < <(sort -n "$zones")
+    else
+      zin='+' zout='?'
+      ((${1} == 0)) || printf '0x00000000  0x%X  %s\n' "$1" "$zout"
+      printf '0x%X  0x%X  %s\n' "$1" "$(($2 - $1))" "$zin"
+      pos=$2
+    fi
+    ((pos >= PART_SIZE)) || printf '0x%X  0x%X  %s\n' "$pos" "$((PART_SIZE - pos))" "$zout"
+  } >"$domain"
+}
+
+# --- Phases --------------------------------------------------------------------------------------
+
+# Does the map have blocks of this kind (non-tried, non-trimmed, non-scraped, bad-sector) outside
+# the zones? If the zones cover the whole device there is nothing outside.
+has() {
+  local -a dom=()
+  if zones_exist && (($(awk '{s += $2 - $1} END {printf "%.0f", s}' "$zones") >= PART_SIZE)); then return 1; fi
+  if zones_exist; then
+    write_domain outside
+    dom=(-m "$domain")
+  fi
+  ! ddrescuelog "${dom[@]}" -t "$map" | grep -E "^ *$1: +0 B," >/dev/null
+}
+next_phase() {
+  if [[ ! -f $map ]] || has non-tried; then
+    echo copy
+  elif has non-trimmed || has non-scraped; then
+    echo scrape
+  elif has bad-sector && [[ ! -e $logs/retry.done ]]; then
+    echo retry
+  elif zones_exist && ! zones_abandoned; then
+    if [[ -n "$(zone_next)" ]]; then echo zones; else echo zones-stuck; fi
+  elif [[ ! -e $logs/report.done ]]; then
+    echo report
+  elif ((extract)) && [[ ! -e $logs/extract.done ]]; then
+    echo extract
+  else
+    echo "done"
+  fi
+}
+
+# Runs ddrescue for a phase under the watchdog. Exit code 10 — stopped because of the temperature,
+# 11 — the disk dropped; otherwise the exit code of ddrescue.
+run_ddrescue() {
+  local phase=$1 t last=$SECONDS paused=0 rc=0
+  RATES="$logs/rates-$(date '+%Y%m%d-%H%M%S')-$phase.log"
+  local -a args=(-d -b "$SECTOR" -T 10m --log-events="$logs/events.log" --log-rates="$RATES")
+  case $phase in
+    copy)
+      # From the same place (or --start-at on the first run), but always from pass 1: ddrescue
+      # would continue from the pass recorded in the map, and in the last one (5) it skips neither
+      # errors nor slow places (-a has no effect).
+      if [[ -n $TARGET_RANGES ]]; then
+        set_map_pos 0
+      elif [[ -n $start_at ]]; then
+        [[ -f $map ]] || printf '# %s\n0x00000000  ?  1\n0x00000000  0x%X  ?\n' "$PROG" "$PART_SIZE" >"$map"
+        set_map_pos "$start_at"
+        note "reading starts at $(gb "$start_at")"
+        start_at=""
+      elif [[ -f $map ]]; then
+        set_map_pos "$(map_pos)"
+      fi
+      args+=(-n)
+      [[ -z $min_rate ]] || args+=(-a "$min_rate")
+      [[ -z $skip_size ]] || args+=(-K "$skip_size")
+      ((!reverse)) || args+=(-R)
+      ;;
+    zones)
+      read -r ZS ZE ZD _ < <(zone_next)
+      args+=(-n)
+      if [[ $ZD == f ]]; then set_map_pos "$ZS"; else
+        set_map_pos "$ZE"
+        args+=(-R)
+      fi
+      note "deferred zone $(gb "$ZS") – $(gb "$ZE"), reading from the $([[ $ZD == f ]] && echo start || echo end)"
+      ;;
+    retry) args+=(-r "$retries") ;;
+  esac
+  if [[ -n $TARGET_RANGES ]]; then
+    write_ranges_domain "$TARGET_RANGES"
+    args+=(-m "$domain")
+  elif [[ $phase == zones ]]; then
+    write_domain "$ZS" "$ZE"
+    args+=(-m "$domain")
+  elif zones_exist; then
+    write_domain outside
+    args+=(-m "$domain")
+  fi
+  note "phase $phase: ddrescue ${args[*]} $dev $img $map"
+  # fd 8 holds the run lock: children must not inherit it, or a child that outlives the tool
+  # (the sleep below, a tee) would keep the next run out.
+  ddrescue "${args[@]}" "$dev" "$img" "$map" 8>&- > >(tee -a "$logs/ddrescue-$phase.log" 8>&-) 2>&1 &
+  DD_PID=$!
+  while kill -0 "$DD_PID" 2>/dev/null; do
+    sleep "$interval" 8>&- &
+    wait $! || true
+    kill -0 "$DD_PID" 2>/dev/null || break
+    if ! device_ok; then
+      note "the disk dropped — stopping ddrescue before it marks the rest as bad"
+      kill -TERM "$DD_PID" 2>/dev/null || true
+      wait "$DD_PID" 2>/dev/null || true
+      DD_PID=""
+      return 11
+    fi
+    t="$(temperature)" || t=""
+    if [[ -n $t ]] && ((t >= stop)); then
+      note "temperature $t °C ≥ $stop °C — stopping ddrescue, the map is saved"
+      # TERM, not INT: background processes of a script without job control ignore SIGINT.
+      kill -TERM "$DD_PID"
+      paused=1
+      break
+    fi
+    if ((SECONDS - last >= 300)); then
+      # On a terminal ddrescue's own display shows the progress: only the log gets the line.
+      if [[ -t 1 ]]; then
+        printf '%s temperature %s °C, %s\n' "$(date '+%F %T')" "${t:-?}" "$(status_short)" >>"$LOG"
+      else
+        note "temperature ${t:-?} °C, $(status_short)"
+      fi
+      last=$SECONDS
+    fi
+  done
+  wait "$DD_PID" || rc=$?
+  DD_PID=""
+  printf '\n'
+  if ((paused)); then return 10; fi
+  return "$rc"
+}
+
+# Unread parts of the map as "START END" lines (bytes), adjacent pieces merged. TYPES — which
+# blocks count, for example "-" or "?*/-".
+map_ranges() {
+  local types=$1 pos size st b0 b1 cs="" ce=""
+  while read -r pos size st; do
+    b0=$((pos)) b1=$((pos + size))
+    if [[ $types == *"$st"* ]]; then
+      if [[ -n $cs ]] && ((b0 <= ce)); then ce=$b1; else
+        [[ -z $cs ]] || echo "$cs $ce"
+        cs=$b0 ce=$b1
+      fi
+    elif [[ -n $cs ]]; then
+      echo "$cs $ce"
+      cs=""
+    fi
+  done < <(awk '!/^#/ && ++n > 1' "$map")
+  [[ -z $cs ]] || echo "$cs $ce"
+}
+# Device size from the end of a map.
+map_size() {
+  awk '!/^#/ && ++n > 1 {p = $1; s = $2} END {print p, s}' "$1" | { read -r p s; echo $((p + s)); }
+}
+
+# --- File level (NTFS through The Sleuth Kit) ------------------------------------------------------
+
+# Until ddrescue reaches the end, the image is shorter than the partition; extend it (sparse) so
+# that reads past its end do not abort parsing of the volume. The data of the image is unchanged.
+# Sets FS_STATE (and says why when the file level is not possible) and always returns 0, so that it
+# runs with errexit in effect: skipped — this image has no file level (--no-fs, not NTFS, a partition
+# table, unreadable boot sector); missing — The Sleuth Kit is not installed (fixable, so the callers
+# must not record the file level as done).
+image_prepare() {
+  local fstype fsout
+  FS_STATE=skipped
+  ((!no_fs)) || return 0
+  if ! tsk_available; then
+    FS_STATE=missing
+    warn "The Sleuth Kit (fls, istat, icat, fsstat, ils) is missing: no file level (apt install sleuthkit)"
+    return 0
+  fi
+  if (($(stat -c %s "$img") < PART_SIZE)); then truncate -s "$PART_SIZE" "$img" || die "cannot extend $img to the size of the device"; fi
+  fsout="$(fsstat "$img" 2>/dev/null)" || fsout=""
+  fstype="$(awk -F': *' '/^File System Type:/ {print $2; exit}' <<<"$fsout")"
+  if [[ $fstype != NTFS ]]; then
+    if [[ -n $fstype ]]; then
+      note "the file system is $fstype: the file level supports NTFS only; the image itself is fine"
+    elif blkid -p -o value -s PTTYPE "$img" 2>/dev/null | grep . >/dev/null; then
+      note "the image has a partition table: the file level needs a partition image (image the partition, for example /dev/sdX1)"
+    else
+      note "the image is not recognised as NTFS (fsstat): no file level; the image itself is fine"
+    fi
+    return 0
+  fi
+  CLUSTER="$(awk -F': *' '/^Cluster Size/ {print $2; exit}' <<<"$fsout")"
+  if [[ ! $CLUSTER =~ ^[0-9]+$ ]]; then
+    note "cluster size of the volume is unknown (fsstat): no file level"
+    return 0
+  fi
+  FS_STATE=ok
+}
+tsk_available() {
+  local c
+  for c in fls istat icat fsstat ils; do command -v "$c" >/dev/null || return 1; done
+}
+# Regular files of the volume: "ID<TAB>PATH" (ID — the MFT entry with a data attribute, for icat).
+# System files ($…) and named streams (a path with ":") are skipped. A directory entry that points
+# to an MFT entry which is readable and *not in use* (a stale index record of a deleted file) is
+# skipped too; if the entry cannot be read at all it is kept, and file_map will call it unknown —
+# a file must not vanish from the lists because its MFT entry is damaged. fls builds paths by
+# walking directories; an allocated MFT entry that the walk does not reach is listed anyway, as
+# "?/NAME", and counts as incomplete: losing a file silently is worse. Entries below 24 are system
+# entries. A fragmented file is listed by fls twice (once per attribute, see file_map) — one line
+# per entry and path remains. A name with a tab cannot be put in the list: it becomes "?/entry N".
+tsk_files() {
+  local listed="$TMPD/fls.txt" alloc="$TMPD/ils-alloc.txt" i out name id path check
+  fls -r -p -u "$img" >"$listed" 2>/dev/null || true
+  # ils only saves work: entries it does not list as allocated are verified with istat below.
+  ils -a "$img" 2>/dev/null | awk -F'|' 'NR > 3 && $2 == "a" && $1 >= 24 {print $1}' | sort -u >"$alloc" || true
+  if [[ ! -s $alloc && -s $listed ]]; then
+    warn "ils listed no allocated entries: every entry is checked with istat, and unlisted entries cannot be found"
+  fi
+  while IFS=$'\t' read -r id path check; do
+    if [[ $check == 1 ]]; then
+      out="$(istat "$img" "${id%%-*}" 2>/dev/null)" || out=""
+      ! grep '^Not Allocated File' <<<"$out" >/dev/null || continue
+    fi
+    printf '%s\t%s\n' "$id" "$path"
+  done < <(ALLOC="$alloc" awk -F'\t' '
+    BEGIN { while ((getline l < ENVIRON["ALLOC"]) > 0) a[l] = 1 }
+    $1 ~ /^r\/r / { split($1, f, " "); id = f[2]; sub(/:$/, "", id)
+      rec = id; sub(/-.*/, "", rec)
+      if ($2 ~ /^\$/ || $2 ~ /:/) next
+      if (NF > 2) { if (!seen[rec "\t?"]++) print id "\t?/entry " rec "\t" (rec in a ? 0 : 1); next }
+      if (seen[rec "\t" $2]++) next
+      print id "\t" $2 "\t" (rec in a ? 0 : 1) }' "$listed")
+  while read -r i; do
+    out="$(istat "$img" "$i" 2>/dev/null)" || continue
+    grep '^Allocated File' <<<"$out" >/dev/null || continue
+    name="$(awk -F': ' '/^Name:/ {print $2; exit}' <<<"$out")"
+    printf '%s\t?/%s\n' "$i" "${name:-entry $i}"
+  done < <(comm -23 "$alloc" \
+    <(awk '{split($2, a, "-"); sub(/:$/, "", a[1]); print a[1]}' "$listed" | sort -u))
+}
+# Where the data of a file lies (MFT entry REC). The first line is
+# "SIZE INITIALISED KIND MTIME_UTC"; then the pieces in order, "VCN LCN LENGTH" in clusters (LCN
+# "-" is a sparse piece: zeros). KIND: resident — data inside the MFT entry; simple — one data
+# attribute; packed — compressed or encrypted (only through icat); split — pieces in several MFT
+# entries; broken — pieces do not add up or do not cover the whole file (then the file counts as
+# incomplete).
+# The piece list of a heavily fragmented file does not fit in one MFT entry and continues in
+# others; $ATTRIBUTE_LIST of the base entry says which entry holds which range (from which VCN).
+# The Sleuth Kit 4.12 stitches such files together wrongly: a piece from the base entry goes to a
+# separate attribute and a filler stands in its place (icat then returns zeros there at the right
+# size); in some files the pieces of an entry are shifted by thousands of clusters, in one the tail
+# is missing (most of a multi-gigabyte file); size and initialised size can be wrong too. So the TSK stitching is not
+# used: every piece is taken from its own entry (istat of that entry) and only within the range of
+# that entry according to the attribute list; sizes come from the entry where VCN 0 starts.
+file_map() {
+  local rec=$1 base ext e
+  base="$(istat -r -z UTC "$img" "$rec" 2>/dev/null)" || return 1
+  ext="$(awk -v r="$rec" '/^Type: 128-[0-9]+[ \t]+MFT Entry: / && $5 != r {print $5}' <<<"$base" | sort -un)"
+  {
+    printf '%s\n' "$base"
+    for e in $ext; do istat -r "$img" "$e" 2>/dev/null || true; done
+  } | awk -v multi="${ext:+1}" '
+    /^MFT Entry Header Values:/ { n++; next }
+    /^Entry:/ { r = $2; next }
+    n == 1 && /^File Modified:/ && mt == "" { sub(/^File Modified:[ \t]*/, ""); sub(/ \(UTC\)$/, ""); mt = $0; next }
+    # Attribute list: "Type: 128-ID  MFT Entry: ENTRY  VCN: START".
+    n == 1 && /^Type: 128-[0-9]+[ \t]+MFT Entry: / { m++; lid[m] = $2; lrec[m] = $5; lv[m] = $7; next }
+    /^Type: / { data = ($2 == "$DATA" && $5 == "N/A"); vcn = 0; first = 1
+      if (!data) next
+      sz = ""; isz = ""
+      for (i = 1; i <= NF; i++) { if ($i == "size:") sz = $(i + 1); if ($i == "init_size:") isz = $(i + 1) }
+      if (/Compressed|Encrypted/) packed = 1
+      if (n == 1 && !/Non-Resident/) { resident = 1; size = sz; init = sz }
+      if (!multi) { lo = 0; hi = -1; next }
+      # The range of this entry by the list: [lo, hi); an attribute that is not in the list (a
+      # TSK stitch) does not count.
+      id = $3; gsub(/[()]/, "", id); lo = -1; hi = -1
+      for (i = 1; i <= m; i++) if (lid[i] == id && lrec[i] == r) lo = lv[i]
+      if (lo < 0) { data = 0; next }
+      for (i = 1; i <= m; i++) if (lv[i] > lo && (hi < 0 || lv[i] < hi)) hi = lv[i]
+      if (lo == 0) { size = sz; init = isz }
+      next }
+    data && /Starting address:/ { gsub(/,/, "")
+      # Without a list the size comes from the attribute that starts at VCN 0.
+      if (!multi && n == 1 && first && $6 != "Filler" && size == "") { size = sz; init = isz }
+      first = 0
+      if ($6 == "Filler") { vcn += $5; next }
+      if (!multi || (vcn >= lo && (hi < 0 || vcn + $5 <= hi))) print vcn, ($6 == "Sparse" ? "-" : $3), $5
+      vcn += $5 }
+    END { kind = resident ? "resident" : multi ? (packed ? "broken" : "split") : (packed ? "packed" : "simple")
+      print "M", (size == "" ? "-" : size), (init == "" ? 0 : init), kind, mt }' |
+    sort -n | uniq | awk -v cs="$CLUSTER" '
+      BEGIN { pos = 0 }
+      $1 == "M" { size = $2; init = $3; kind = $4; mt = $0; sub(/^M [^ ]* [^ ]* [^ ]* ?/, "", mt); next }
+      { if ($1 != pos) bad = 1
+        pos = $1 + $3
+        if (k && $2 != "-" && rl[k] != "-" && rl[k] + rn[k] == $2) { rn[k] += $3; next }
+        k++; rv[k] = $1; rl[k] = $2; rn[k] = $3 }
+      END { if (size == "-") { size = 0; bad = 1 }
+        if (kind != "resident" && (bad || pos * cs < size)) kind = "broken"
+        print size, init, kind, mt
+        for (i = 1; i <= k; i++) print rv[i], rl[i], rn[i] }'
+}
+# Ranges "START END" from files, ascending; overlapping and adjacent ones merged.
+merge_ranges() {
+  sort -n "$@" | awk '{ if (n && $1 <= e) { if ($2 > e) e = $2 } else { if (n) print s, e; s = $1; e = $2; n = 1 } }
+                      END { if (n) print s, e }'
+}
+# Classifies the files of tsk_files (stdin) against the ranges RANGES (bytes), one line per file:
+# "STATE<TAB>ID<TAB>SIZE<TAB>MTIME_UTC<TAB>PATH<TAB>BYTES_IN_RANGES". The state is intact (data
+# entirely outside the ranges), damaged (touches them) or unknown (the entry cannot be parsed or
+# its pieces do not add up — better to download again).
+# Paths and keys go to awk through the environment: awk -v interprets backslashes in values.
+classify() {
+  local ranges="$TMPD/classify-ranges.txt" id path fmap
+  merge_ranges "$1" >"$ranges"
+  while IFS=$'\t' read -r id path; do
+    if ! fmap="$(file_map "${id%%-*}")"; then
+      printf 'unknown\t%s\t\t\t%s\t\n' "$id" "$path"
+      continue
+    fi
+    CS="$CLUSTER" RANGES="$ranges" FID="$id" FPATH="$path" awk '
+      # The first range that ends after B (ranges ascend and do not overlap).
+      function after(b, lo, hi, mid) { lo = 1; hi = n + 1
+        while (lo < hi) { mid = int((lo + hi) / 2); if (re[mid] > b) hi = mid; else lo = mid + 1 }
+        return lo }
+      BEGIN { cs = ENVIRON["CS"] + 0; path = ENVIRON["FPATH"]; id = ENVIRON["FID"]
+        while ((getline line < ENVIRON["RANGES"]) > 0) { split(line, r, " "); n++; rs[n] = r[1] + 0; re[n] = r[2] + 0 } }
+      NR == 1 { size = $1; kind = $3; mt = $0; sub(/^[^ ]* [^ ]* [^ ]* ?/, "", mt); next }
+      $2 != "-" { b0 = $2 * cs; b1 = ($2 + $3) * cs
+        for (i = after(b0); i <= n && rs[i] < b1; i++) {
+          lo = (b0 > rs[i] ? b0 : rs[i]); hi = (b1 < re[i] ? b1 : re[i]); miss += hi - lo } }
+      END { st = kind == "broken" ? "unknown" : (miss > 0 ? "damaged" : "intact"); if (path ~ /^\?\//) st = "unknown"
+        printf "%s\t%s\t%s\t%s\t%s\t%.0f\n", st, id, size, mt, path, miss }' <<<"$fmap"
+  done
+}
+# The contents of a file by the file_map result, to stdout: pieces from the image in order, sparse
+# ones as zeros, zeros from the initialised size to the size, as NTFS returns them. Data inside the
+# MFT entry and compressed data go through icat (ID is the attribute for icat).
+file_stream() {
+  local fmap=$1 id=$2 size init kind s n
+  read -r size init kind _ <<<"$fmap"
+  if [[ $kind != simple && $kind != split ]]; then
+    icat "$img" "$id"
+    return
+  fi
+  ((init <= size)) || init=$size
+  while read -r s n; do
+    if [[ $s == - ]]; then
+      head -c "$n" /dev/zero
+    else
+      dd if="$img" bs=1M iflag=skip_bytes,count_bytes skip="$s" count="$n" status=none
+    fi
+  done < <(sed 1d <<<"$fmap" | awk -v cs="$CLUSTER" -v init="$init" '
+    { n = $3 * cs; if (got + n > init) n = init - got; if (n <= 0) exit
+      if ($2 == "-") printf "- %.0f\n", n; else printf "%.0f %.0f\n", $2 * cs, n
+      got += n }')
+  head -c "$((size - init))" /dev/zero
+}
+
+# --- Extraction ----------------------------------------------------------------------------------
+
+# Owner of extracted files: --owner, else the user who ran sudo, else root. Files are written as
+# that user (runuser), so a setgid directory passes its group on.
+setup_owner() {
+  local user group=""
+  RUN_AS=()
+  if [[ -n $owner ]]; then
+    user="${owner%%:*}"
+    [[ $owner != *:* ]] || group="${owner#*:}"
+  elif [[ -n ${SUDO_USER:-} ]] && ((EUID == 0)); then
+    user=$SUDO_USER
+  else
+    user="$(id -un)"
+  fi
+  id -u "$user" >/dev/null 2>&1 || die "--owner: no such user: $user"
+  [[ -z $group ]] || getent group "$group" >/dev/null || die "--owner: no such group: $group"
+  if [[ $user != "$(id -un)" ]]; then
+    ((EUID == 0)) || die "extracting as another user ($user) needs root"
+    RUN_AS=(runuser -u "$user")
+    [[ -z $group ]] || RUN_AS+=(-g "$group")
+    RUN_AS+=(--)
+  fi
+  "${RUN_AS[@]}" test -w "$extract_to" || die "$extract_to is not writable for $user"
+}
+# Where a file of the volume goes: the first --map whose source matches, otherwise the same path
+# below --extract-to. Prints nothing if --include/--map filter the file out.
+dest_for() {
+  local path=$1 m inc
+  [[ $path != *"/../"* && $path != "../"* && $path != "?/"* ]] || return 0 # "?/" rows are unknown entries
+  for m in "${maps[@]}"; do
+    local src="${m%%:*}" dst="${m#*:}"
+    if [[ $path == "$src/"* ]]; then
+      printf '%s/%s%s' "$extract_to" "${dst:+$dst/}" "${path#"$src/"}"
+      return 0
+    elif [[ $path == "$src" ]]; then
+      printf '%s/%s%s' "$extract_to" "${dst:+$dst/}" "${path##*/}"
+      return 0
+    fi
+  done
+  if ((${#includes[@]} + ${#maps[@]})); then
+    for inc in "${includes[@]}"; do
+      if [[ $path == "$inc" || $path == "$inc/"* ]]; then
+        printf '%s/%s' "$extract_to" "$path"
+        return 0
+      fi
+    done
+    return 0
+  fi
+  printf '%s/%s' "$extract_to" "$path"
+}
+make_dirs() {
+  local d=$1
+  [[ ! -d $d ]] || return 0
+  make_dirs "$(dirname "$d")"
+  "${RUN_AS[@]}" mkdir -m "$dir_mode" "$d"
+}
+# Extracts the files of a classify table into --extract-to (with only_intact=1 — only intact ones).
+# A file already extracted with the same size and time is skipped, so extraction can be
+# interrupted. Data is checked against SUSPECT_RE on the way; such files are extracted but go to
+# the list of suspicious files — better downloaded again. Size and mtime alone do not catch
+# corruption if the writes were cut short (for example a USB bridge without FUA): after an abrupt
+# disconnect of the target, check the last files written (see README).
+extract_files() {
+  local tsv=$1 only_intact=$2 state id size mt path dst epoch fmap kind suspect copied=0 skipped=0
+  local suspicious="$logs/suspicious-files.txt"
+  touch "$suspicious"
+  while IFS=$'\t' read -r state id size mt path _; do
+    ((!only_intact)) || [[ $state == intact ]] || continue
+    [[ -n $size && -n $mt ]] || continue
+    dst="$(dest_for "$path")"
+    [[ -n $dst ]] || continue
+    epoch="$(date -d "$mt UTC" +%s)"
+    if [[ -f $dst && "$(stat -c '%s %Y' "$dst")" == "$size $epoch" ]]; then
+      skipped=$((skipped + 1))
+      continue
+    fi
+    fmap="$(file_map "${id%%-*}")" || die "MFT entry ${id%%-*} is unreadable: $path"
+    read -r _ _ kind _ <<<"$fmap"
+    if [[ $kind == broken ]]; then
+      note "  skipped (the pieces of the file do not add up in the MFT — download again): $path"
+      continue
+    fi
+    log "  → $path ($(numfmt --to=si "$size")B)"
+    make_dirs "$(dirname "$dst")"
+    # The exit status does not matter (grep without a match returns 1): the size check below
+    # proves the copy is complete.
+    suspect="$(file_stream "$fmap" "$id" | "${RUN_AS[@]}" tee "$dst.part" |
+      if [[ -n $SUSPECT_RE ]]; then grep -c -aP "$SUSPECT_RE"; else cat >/dev/null; fi)" || true
+    [[ "$(stat -c %s "$dst.part" 2>/dev/null)" == "$size" ]] ||
+      die "the size of $dst.part does not match the image ($size): run the command again"
+    # shellcheck disable=SC2016 # $1, $2, $3 are expanded by the inner sh
+    "${RUN_AS[@]}" sh -c 'mv "$1.part" "$1" && chmod "$3" "$1" && touch -d "$2 UTC" "$1"' _ "$dst" "$mt" "$file_mode"
+    if ((${suspect:-0})); then
+      note "  suspicious data inside (garbage from the disk or a long run of zeros) — better download again"
+      printf '%s\n' "$path" >>"$suspicious"
+    fi
+    copied=$((copied + 1))
+  done <"$tsv"
+  sort -u -o "$suspicious" "$suspicious"
+  note "extracted files: $copied, already in place: $skipped"
+  [[ ! -s $suspicious ]] || note "with suspicious data ($(wc -l <"$suspicious")) — download again: $suspicious"
+}
+report() {
+  local s e _ damaged="$logs/damaged-files.txt" ranges="$logs/report-ranges.txt"
+  note "summary by the map:"
+  summary
+  map_ranges "-" >"$ranges"
+  if zones_exist && zones_abandoned; then
+    note "abandoned zones: $(zones_text)"
+    while read -r s e _; do echo "$s $e"; done <"$zones" >>"$ranges"
+  fi
+  image_prepare
+  if [[ $FS_STATE != ok ]]; then
+    note "unreadable byte ranges: $ranges"
+    return 0
+  fi
+  tsk_files | classify "$ranges" >"$logs/files.tsv"
+  awk -F'\t' '$1 != "intact" {print $5}' "$logs/files.tsv" | sort >"$damaged"
+  note "files in the image: $(wc -l <"$logs/files.tsv")"
+  if [[ -s $damaged ]]; then
+    note "damaged files ($(wc -l <"$damaged")) — get them again: $damaged"
+    sed 's/^/  /' "$damaged"
+  else
+    note "the unreadable areas touched no file"
+  fi
+}
+extract() {
+  if [[ ! -f $logs/files.tsv ]]; then
+    report
+    [[ -f $logs/files.tsv ]] || return 0
+  fi
+  extract_files "$logs/files.tsv" "$((!extract_damaged))"
+}
+# Without the disk: what is already rescued whole and what is missing; with --extract, extract the
+# intact files.
+inventory_run() {
+  local ranges="$logs/inventory-ranges.txt" tsv="$logs/inventory.tsv" src pair
+  map_ranges "?*/-" >"$ranges"
+  image_prepare
+  [[ $FS_STATE == ok ]] || die "no file level for this image (see above)"
+  tsk_files | classify "$ranges" >"$tsv"
+  awk -F'\t' '$1 == "intact" {print $5}' "$tsv" >"$logs/inventory-intact.txt"
+  awk -F'\t' '$1 != "intact" {print $5}' "$tsv" >"$logs/inventory-incomplete.txt"
+  note "files in the image: $(wc -l <"$tsv"); rescued whole: $(wc -l <"$logs/inventory-intact.txt"), incomplete: $(wc -l <"$logs/inventory-incomplete.txt")"
+  if ((${#includes[@]} + ${#maps[@]})); then
+    for pair in "${includes[@]}" "${maps[@]}"; do
+      src="${pair%%:*}/"
+      note "  $src: whole $(grep -c -F -- "$src" "$logs/inventory-intact.txt" || true), incomplete $(grep -c -F -- "$src" "$logs/inventory-incomplete.txt" || true)"
+    done
+  else
+    # per top-level directory (files in the root are counted under "/")
+    { awk '{ n = index($0, "/"); print (n ? substr($0, 1, n - 1) : "/") "\twhole" }' "$logs/inventory-intact.txt"
+      awk '{ n = index($0, "/"); print (n ? substr($0, 1, n - 1) : "/") "\tincomplete" }' "$logs/inventory-incomplete.txt"
+    } | awk -F'\t' '{ c[$1 "\t" $2]++; d[$1] = 1 }
+        END { for (k in d) printf "  %s/: whole %d, incomplete %d\n", k, c[k "\twhole"], c[k "\tincomplete"] }' | sort | head -25 |
+      while IFS= read -r line; do note "$line"; done
+  fi
+  note "lists: $logs/inventory-intact.txt, $logs/inventory-incomplete.txt"
+  if ((extract)); then extract_files "$tsv" 1; fi
+}
+
+# --- Targeted recovery -----------------------------------------------------------------------------
+
+# Where the data of a file lies: "START END" (bytes) per piece of file_map.
+file_byte_ranges() {
+  { file_map "${1%%-*}" || true; } | awk -v cs="$CLUSTER" 'NR > 1 && $2 != "-" { printf "%.0f %.0f\n", $2 * cs, ($2 + $3) * cs }'
+}
+# The ddrescue domain from the ranges RANGES: they are "+", the rest is outside the domain.
+write_ranges_domain() {
+  local pos=0 s e
+  {
+    printf '# %s: ddrescue domain (selected files)\n0x00000000  +  1\n' "$PROG"
+    while read -r s e; do
+      ((s <= pos)) || printf '0x%X  0x%X  ?\n' "$pos" "$((s - pos))"
+      printf '0x%X  0x%X  +\n' "$s" "$((e - s))"
+      pos=$e
+    done < <(merge_ranges "$1")
+    ((pos >= PART_SIZE)) || printf '0x%X  0x%X  ?\n' "$pos" "$((PART_SIZE - pos))"
+  } >"$domain"
+}
+# Are there blocks of this kind inside the selected files?
+has_in() {
+  write_ranges_domain "$TARGET_RANGES"
+  ! ddrescuelog -m "$domain" -t "$map" | grep -E "^ *$1: +0 B," >/dev/null
+}
+# A short caption of a file for the selection window: at most 60 characters.
+short_name() {
+  (
+    LC_ALL=C.UTF-8
+    p=$1
+    ((${#p} <= 60)) || p="${p:0:28}…${p: -31}"
+    printf '%s' "$p"
+  )
+}
+# Selection window: whiptail, or plain questions without it. Everything the person sees goes
+# through /dev/tty, stdout is only the answers. ui_checklist TEXT TAG DESCRIPTION [TAG DESCRIPTION...]
+# prints the chosen tags one per line; status 1 — cancelled.
+ui_checklist() {
+  local text=$1 args=() answer tag n=0 lines cols h w
+  shift
+  if ! command -v whiptail >/dev/null || [[ ${LASTREAD_PLAIN:-0} == 1 ]]; then
+    printf '\n%s\n' "$text" >/dev/tty
+    while (($#)); do
+      printf '  %s — %s\n' "$1" "$2" >/dev/tty
+      shift 2
+    done
+    printf 'Tags separated by spaces: ' >/dev/tty
+    read -r answer </dev/tty
+    [[ -n $answer ]] || return 1
+    for tag in $answer; do printf '%s\n' "$tag"; done
+    return 0
+  fi
+  while (($#)); do
+    args+=("$1" "$2" OFF)
+    n=$((n + 1))
+    shift 2
+  done
+  lines="$(tput lines 2>/dev/null || echo 24)"
+  cols="$(tput cols 2>/dev/null || echo 80)"
+  h=$((lines > 34 ? 30 : lines - 4))
+  w=$((cols > 104 ? 100 : cols - 4))
+  LC_ALL=C.UTF-8 whiptail --backtitle "$PROG — file selection" --title "$PROG" --separate-output \
+    --checklist "$text" "$h" "$w" "$((h - 8))" "${args[@]}" 3>&1 1>&2 2>&3 </dev/tty >/dev/tty
+}
+targeted_run() {
+  local cand="$logs/target-candidates.tsv" sel="$logs/target-selected.tsv" unread="$logs/target-unread.txt"
+  local ranges="$logs/target-ranges.txt" n state id size path miss retried=0 phase rc p before tag pat choice
+  local -a items=() tags=()
+  image_prepare
+  [[ $FS_STATE == ok ]] || die "no file level for this image (see above)"
+  map_ranges "?*/-" >"$unread"
+  # Candidates are the incomplete files. With an inventory only its incomplete files are rechecked
+  # (fast), without one all files of the volume (minutes).
+  note "looking for incomplete files…"
+  if [[ -f $logs/inventory.tsv ]]; then
+    awk -F'\t' '$1 != "intact" {print $2 "\t" $5}' "$logs/inventory.tsv"
+  else
+    tsk_files
+  fi | classify "$unread" | awk -F'\t' '$1 == "damaged"' >"$cand"
+  [[ -s $cand ]] || {
+    note "no incomplete files — nothing to recover selectively"
+    return 0
+  }
+  if ((${#file_patterns[@]})); then
+    : >"$sel"
+    for pat in "${file_patterns[@]}"; do PAT="$pat" awk -F'\t' 'index($5, ENVIRON["PAT"])' "$cand" >>"$sel"; done
+    sort -u -o "$sel" "$sel"
+  else
+    n=0
+    while IFS=$'\t' read -r state id size _ path miss; do
+      n=$((n + 1))
+      items+=("$n" "$(short_name "$path") — $(numfmt --to=si "$size")B, $((miss * 100 / (size > 0 ? size : 1)))% unread")
+    done <"$cand"
+    choice="$(ui_checklist "Incomplete files: which ones to read from the disk first? Space marks, Enter starts." "${items[@]}")" ||
+      die "nothing selected"
+    mapfile -t tags <<<"$choice"
+    : >"$sel"
+    for tag in "${tags[@]}"; do sed -n "${tag}p" "$cand" >>"$sel"; done
+  fi
+  [[ -s $sel ]] || die "nothing selected (no incomplete file has such a path)"
+  note "targeted recovery, files: $(wc -l <"$sel"), unread in them: $(numfmt --to=si "$(awk -F'\t' '{s += $6} END {printf "%.0f", s}' "$sel")")B"
+  awk -F'\t' '{print "  " $5}' "$sel"
+  : >"$ranges"
+  while IFS=$'\t' read -r _ id _; do file_byte_ranges "$id" >>"$ranges"; done <"$sel"
+  TARGET_RANGES=$ranges
+  while :; do
+    if has_in non-tried; then
+      phase=copy
+    elif has_in non-trimmed || has_in non-scraped; then
+      phase=scrape
+    elif has_in bad-sector && ((!retried)); then
+      phase=retry
+    else
+      break
+    fi
+    device_ok || recover_device || die_device
+    p="$(temperature)" || p=""
+    if [[ -n $p ]] && ((p >= stop)); then wait_cool; fi
+    before="$(status_short)"
+    rc=0
+    run_ddrescue "$phase" || rc=$?
+    if ((rc == 11)) || ! device_ok; then
+      revert_artifacts
+      p="$(hang_position "$RATES")"
+      [[ -z $p ]] || zone_hang "$((p))" copy
+      [[ "$(status_short)" == "$before" ]] || recoveries=0
+      recover_device || die_device
+      continue
+    fi
+    [[ "$(status_short)" == "$before" ]] || recoveries=0
+    case $rc in
+      0) [[ $phase != retry ]] || retried=1 ;;
+      10) wait_cool ;;
+      *) die "ddrescue exited with code $rc; logs: $logs" ;;
+    esac
+  done
+  TARGET_RANGES=""
+  # What the earlier report and extraction decided is out of date now: a normal run does them again.
+  rm -f "${logs:?}/files.tsv" "${logs:?}/report.done" "${logs:?}/extract.done"
+  map_ranges "?*/-" >"$unread"
+  awk -F'\t' '{print $2 "\t" $5}' "$sel" | classify "$unread" >"$logs/target-result.tsv"
+  note "result of targeted recovery:"
+  awk -F'\t' '{printf "  %s  %s\n", ($1 == "intact" ? "whole     " : "incomplete"), $5}' "$logs/target-result.tsv"
+  if ((extract)); then extract_files "$logs/target-result.tsv" 1; fi
+}
+
+# --- Main ----------------------------------------------------------------------------------------
+
+cleanup() {
+  [[ -z $INHIBIT_PID ]] || kill "$INHIBIT_PID" 2>/dev/null || true
+  if [[ -n $DD_PID ]] && kill -0 "$DD_PID" 2>/dev/null; then
+    kill -TERM "$DD_PID" 2>/dev/null || true
+    wait "$DD_PID" 2>/dev/null || true
+  fi
+  [[ -z $orig_timeout ]] || echo "$orig_timeout" >"$timeout_file" 2>/dev/null || true
+  [[ -z $TMPD ]] || rm -rf "$TMPD"
+}
+
+# Mount, location and space checks before the first read.
+preflight_device() {
+  local mounted dir_disk need avail extract_disk
+  mounted="$( (findmnt -n -o TARGET -S "$dev" || true; lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null || true) | awk 'NF' | sort -u | paste -sd ' ')" || mounted=""
+  [[ -z $mounted ]] || die "$dev is mounted ($mounted): the source must not be mounted while rescuing"
+  dir_disk="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE --target "$dir")" 2>/dev/null | head -1)" || dir_disk=""
+  [[ $dir_disk != "$parent" ]] || die "$dir is on the same disk as the source"
+  if [[ -n $extract_to ]]; then
+    extract_disk="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE --target "$extract_to")" 2>/dev/null | head -1)" || extract_disk=""
+    [[ $extract_disk != "$parent" ]] || die "$extract_to is on the same disk as the source"
+  fi
+  # Only ddrescue itself (-x), not any command that mentions the path of the map.
+  if pgrep -a -x ddrescue | grep -F -- " $map" >/dev/null; then
+    die "ddrescue is already running with the map $map: stop it (Ctrl+C) and run the command again"
+  fi
+  # st_blocks counts 512-byte units whatever the file system.
+  need=$((PART_SIZE - $(stat -c %b "$img" 2>/dev/null || echo 0) * 512))
+  avail=$(($(stat -f -c '%a * %S' "$dir")))
+  ((avail > need)) || die "not enough space in $dir for the image: $((need / 1000000000)) GB more are needed"
+  if [[ -n $start_at ]]; then
+    ((start_at < PART_SIZE)) || die "--start-at: the position is past the end of the device ($(gb "$PART_SIZE"))"
+  fi
+}
+
+main() {
+  parse_args "$@"
+  if [[ -t 1 ]]; then
+    C_RED=$'\e[31m' C_YELLOW=$'\e[33m' C_BOLD=$'\e[1m' C_RESET=$'\e[0m'
+  fi
+  validate_args
+  trap 'on_err $? "$BASH_COMMAND" "$LINENO"' ERR
+
+  local cmd z t p
+  for cmd in ddrescue ddrescuelog numfmt flock lsblk blockdev; do
+    command -v "$cmd" >/dev/null || die "missing command: $cmd (apt install gddrescue util-linux coreutils)"
+  done
+  if (($(ddrescue --version | awk 'NR == 1 {split($NF, v, "."); print v[1] * 1000 + v[2]}') < 1027)); then
+    warn "GNU ddrescue older than 1.27 is untested"
+  fi
+  if ((!no_fs && (extract || inventory || pick || ${#file_patterns[@]}))) && ! tsk_available; then
+    die "the file level needs The Sleuth Kit (fls, istat, icat, fsstat, ils): apt install sleuthkit"
+  fi
+  ((inventory)) || [[ -n $source_arg ]] || die "no source: give a device (see --help)"
+  ((inventory)) || ((EUID == 0)) || die "root is needed to read the device: run through sudo"
+  ((!extract)) || [[ -d $extract_to ]] || die "--extract-to: no such directory: $extract_to"
+  [[ -d $dir ]] || die "no such directory: $dir (--dir)"
+  dir="$(cd "$dir" && pwd -P)"
+  if [[ -z $name ]]; then
+    if [[ -n $source_arg ]]; then
+      case $source_arg in
+        /dev/disk/* | /dev/mapper/*) ;;
+        *)
+          ((inventory)) || die "--name is required unless SOURCE is a stable path such as /dev/disk/by-id/...: the name of $source_arg can change when the disk comes back, and the image would not match the next run"
+          ;;
+      esac
+      name="$(basename "$source_arg")"
+    elif ((inventory)); then
+      local -a maps_found=()
+      mapfile -t maps_found < <(find "$dir" -maxdepth 1 -name '*.map' ! -name '*.before-revert' -printf '%f\n' | sort)
+      ((${#maps_found[@]} == 1)) || die "--inventory: say which image with --name NAME (found ${#maps_found[@]} maps in $dir)"
+      name="${maps_found[0]%.map}"
+    else
+      die "no source: give a device (see --help)"
+    fi
+  fi
+  [[ $name != */* ]] || die "--name must not contain a slash"
+  img="$dir/$name.img"
+  map="$dir/$name.map"
+  logs="$dir/$name.logs"
+  zones="$logs/zones"
+  domain="$logs/domain.map"
+  LOG="$logs/rescue.log"
+  TMPD="$(mktemp -d -t "$PROG.XXXXXX")"
+  trap cleanup EXIT
+
+  if ((inventory)); then
+    # Without the disk: the size of the partition is the end of the map.
+    [[ -f $map && -f $img ]] || die "no image or map in $dir for \"$name\""
+    PART_SIZE="$(map_size "$map")"
+    if ((DRY_RUN)); then
+      info "inventory of $img: $(status_short); dry-run: nothing is run"
+      return 0
+    fi
+    install -d -m 755 "$logs"
+    exec 8>"$dir/.$name.lock"
+    flock -n 8 || die "another run is in progress for \"$name\": stop it and run --inventory again"
+    note "inventory by the image without the disk: $(status_short)"
+    if ((extract)); then setup_owner; fi
+    inventory_run
+    return 0
+  fi
+
+  [[ $source_arg == /dev/disk/* ]] || warn "$source_arg may change its name when a dropped disk comes back; /dev/disk/by-id/... is safer"
+  # The disk is missing — maybe the kernel dropped it in the previous run: rescan the remembered host.
+  if [[ ! -b $source_arg ]] && ((rescan)) && [[ -f $logs/scsi-host ]]; then
+    info "the disk is missing — rescanning $(cat "$logs/scsi-host")"
+    rescan_host "$(cat "$logs/scsi-host")" || true
+  fi
+  [[ -b $source_arg ]] || die "no block device $source_arg: is the disk connected? What is rescued can be examined without it: $PROG --inventory --name $name --dir $dir"
+  resolve_device
+  PART_SIZE="$(blockdev --getsize64 "$dev")"
+  if [[ -f $map ]]; then
+    [[ "$(map_size "$map")" == "$PART_SIZE" ]] ||
+      die "the map $map covers $(map_size "$map") bytes but $dev has $PART_SIZE: another disk? (--name picks another image)"
+  fi
+  preflight_device
+  for z in "${add_zones[@]}"; do
+    (($(parse_size "${z%%-*}") < PART_SIZE)) || die "--add-zone $z starts past the end of the device ($(gb "$PART_SIZE"))"
+  done
+  if ((extract)); then setup_owner; fi
+  detect_temperature_source
+
+  info "source $source_arg → $dev (disk $whole, ${TRANSPORT:-no transport}, sector $SECTOR), $PART_SIZE bytes"
+  info "image $img, map $map, logs $logs"
+  info "$(status_short)"
+  if ((DRY_RUN)); then
+    ((!$(artifact_bytes))) || info "on start the traces of a dropped disk will be returned to \"not tried\": $(gb "$(artifact_bytes)")"
+    ! zones_exist || info "deferred zones: $(zones_text)$(zones_abandoned && printf ' (given up)')"
+    ((${#add_zones[@]} == 0)) || info "zones to be deferred by hand: ${add_zones[*]}"
+    if [[ -n "$(rescan_unavailable_reason)" ]]; then
+      info "automatic return of a dropped disk: not available ($(rescan_unavailable_reason))"
+    fi
+    info "dry-run: nothing is run (stop at $stop °C, continue at $resume °C)"
+    return 0
+  fi
+
+  install -d -m 755 "$logs"
+  exec 8>"$dir/.$name.lock"
+  flock -n 8 || die "another run is in progress for \"$name\""
+
+  [[ -z $SCSI_HOST ]] || echo "$SCSI_HOST" >"$logs/scsi-host"
+  if ((kernel_timeout > 0)); then
+    if [[ -w $timeout_file ]]; then
+      orig_timeout="$(cat "$timeout_file")"
+      echo "$kernel_timeout" >"$timeout_file"
+    else
+      warn "cannot change the kernel command timeout of $whole ($timeout_file is not writable here)"
+    fi
+  fi
+  # While running, the machine neither sleeps nor reacts to a closed lid.
+  if command -v systemd-inhibit >/dev/null; then
+    systemd-inhibit --what=sleep:idle:handle-lid-switch --who="$PROG" --why="rescuing $name" sleep infinity 8>&- &
+    INHIBIT_PID=$!
+  fi
+  trap 'note "interrupted — run the command again, it continues where it stopped"; exit 130' INT TERM
+
+  note "start: stop at $stop °C, continue at $resume °C, check every ${interval}s; kernel command timeout $([[ -n $orig_timeout ]] && echo "$kernel_timeout s (was $orig_timeout s)" || echo unchanged)"
+  # Once: the same zone is not added again, otherwise an already narrowed zone would widen back.
+  for z in "${add_zones[@]}"; do
+    if grep -Fx -- "$z" "$logs/zones.added" >/dev/null 2>&1; then
+      note "zone $z was added before — skipping"
+      continue
+    fi
+    zone_put "$(parse_size "${z%%-*}")" "$(parse_size "${z#*-}")"
+    printf '%s\n' "$z" >>"$logs/zones.added"
+    note "zone $z deferred by hand: $(zones_text)"
+  done
+  if ((give_up)) && zones_exist; then
+    touch "$logs/zones.abandoned"
+    note "deferred zones given up: $(zones_text)"
+  fi
+  if (($(artifact_bytes) > artifact_limit)); then
+    note "the map has $(gb "$(artifact_bytes)") of unfinished areas — traces of a dropped disk, not bad spots"
+    revert_artifacts
+  fi
+  if ((pick)) || ((${#file_patterns[@]})); then
+    targeted_run
+    note "targeted recovery finished: $(status_short). Continue the normal run with the same command without --pick/--file"
+    return 0
+  fi
+  local phase rc before fails=0 stalls=0 last_phase="" file_level_pending=0
+  while phase="$(next_phase)" && [[ $phase != "done" ]]; do
+    case $phase in
+      copy | scrape | retry | zones)
+        device_ok || recover_device || die_device
+        t="$(temperature)" || t=""
+        if [[ -n $t ]] && ((t >= stop)); then wait_cool; fi
+        before="$(status_short)"
+        rc=0
+        run_ddrescue "$phase" || rc=$?
+        if ((rc == 11)) || ! device_ok; then
+          revert_artifacts
+          p="$(hang_position "$RATES")"
+          [[ -z $p ]] || zone_hang "$((p))" "$phase"
+          [[ "$(status_short)" == "$before" ]] || recoveries=0
+          recover_device || die_device
+          continue
+        fi
+        [[ "$(status_short)" == "$before" ]] || recoveries=0
+        # Safety stop: the phase ends again and again, but the map does not change.
+        if ((rc == 0)) && [[ "$(status_short)" == "$before" && $phase == "${last_phase:-}" ]]; then
+          stalls=$((stalls + 1))
+          ((stalls < 3)) || die "phase $phase ended three times in a row without progress — something is wrong; logs: $logs"
+        else
+          stalls=0
+        fi
+        last_phase=$phase
+        case $rc in
+          0)
+            note "phase $phase finished: $(status_short)"
+            [[ $phase != retry ]] || touch "$logs/retry.done"
+            if [[ $phase == zones ]]; then
+              # The zone is read: from now on it is an ordinary part of the disk, its bad spots go
+              # through scrape and retry.
+              awk -v s="$ZS" -v e="$ZE" '!($1 == s && $2 == e)' "$zones" >"$zones.new"
+              mv "$zones.new" "$zones"
+              [[ -s $zones ]] || rm -f "$zones"
+              rm -f "$logs/retry.done"
+            fi
+            fails=0
+            ;;
+          10) wait_cool ;;
+          *)
+            if [[ "$(status_short)" == "$before" ]]; then fails=$((fails + 1)); else fails=0; fi
+            ((fails < 5)) || die "ddrescue failed five times in a row without progress (code $rc); logs: $logs"
+            warn "ddrescue exited with code $rc, the disk answers — continuing"
+            ;;
+        esac
+        ;;
+      zones-stuck)
+        warn "deferred zones remain that the disk does not read from either side: $(zones_text)"
+        warn "give them up (files inside will be reported as damaged): run the same command with --give-up-zones added"
+        exit 2
+        ;;
+      report)
+        report
+        if [[ $FS_STATE == missing ]]; then
+          # Fixable: do not record the report as done, and do not loop on it.
+          file_level_pending=1
+          break
+        fi
+        touch "$logs/report.done"
+        # No file level for this image: there is nothing to extract either.
+        [[ $FS_STATE == ok ]] || touch "$logs/extract.done"
+        ;;
+      extract)
+        extract
+        touch "$logs/extract.done"
+        ;;
+    esac
+  done
+  if ((file_level_pending)); then
+    note "imaging finished: $(status_short). The file level was not done: install the Sleuth Kit and run the same command again"
+    return 0
+  fi
+  note "done: $(status_short)"
+  if ((!extract)) && [[ -z $extract_to ]]; then
+    info "to extract files from the image: $PROG --inventory --name $name --dir $dir --extract --extract-to DIR"
+  fi
+}
+
+# Run only when executed, not when sourced (the unit tests source this file).
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi

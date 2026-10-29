@@ -1,0 +1,3 @@
+# Follow `source` directives so that variables the tests read from the tool are known.
+external-sources=true
+source-path=SCRIPTDIR
