@@ -10,9 +10,10 @@ loop the tool derives the next phase from them (`next_phase`), runs it under the
 looks at what happened:
 
 ```
-copy → scrape → retry → zones → report → extract
+meta → copy → scrape → retry → zones → report → extract
 ```
 
+- `meta`: NTFS only, once (see "Metadata first").
 - `copy`: `ddrescue -n` (no trimming, no scraping): read what reads, skip what does not.
 - `scrape`: read the skipped areas sector by sector.
 - `retry`: `-r N` passes over the unreadable sectors.
@@ -30,6 +31,47 @@ the status line (`set_map_pos`) to "position unchanged, pass 1" (or to `--start-
 **Safety stops.** A phase that ends three times in a row without the map changing, or ddrescue failing five times in
 a row without progress, stops the tool instead of looping forever. Deferred zones that cover the whole device leave
 nothing outside them to read, and `has` knows it.
+
+## File system families
+
+`fsstat` names the file system and `fs_kind_of` maps it to a family: `ntfs`, `ext` (ext2/3/4) or `fat` (FAT12/16/32,
+exFAT). The family decides three things and nothing else:
+
+- the unit of the pieces `file_map` reports (`CLUSTER`): the cluster of NTFS, the block of ext, the sector of
+  FAT/exFAT (`istat -r` lists FAT runs in sectors);
+- how `file_map` reads `istat -r`: NTFS needs its attribute-list logic (`file_map_ntfs`); ext and FAT print a plain run
+  list, where a `Filler` before the first run and `Sparse` runs are holes (zeros), and ext inline data is resident
+  (`file_map_blocks`); both end in the same normalisation (`file_map_normalize`: sort, merge neighbours, mark a file
+  `broken` if the pieces leave a hole or fall short of the size);
+- the listing rules in `tsk_files`: NTFS drops its system files, named streams and stale index entries; ext keeps
+  names like `$x` and `a:b`, drops directories and looks for allocated inodes the walk did not reach (`?/entry N`);
+  FAT and exFAT drop their pseudo files (`$FAT1`, `$ALLOC_BITMAP`, …) and have no table to compare the walk with.
+
+FAT and exFAT are recognised from the boot sector (`boot_probe`) and the "fsstat output" for them is synthesised
+(`fs_probe`): `fsstat` of The Sleuth Kit 4.12 does not return on exFAT (it was observed spinning for minutes), and
+the other `fsstat` calls run under a time limit for the same reason. The metadata-first phase knows only NTFS.
+
+## Metadata first
+
+With a dying disk the order of reading decides what survives. Before the ordinary copy, on an NTFS volume, the tool
+reads (`meta_run`), each step with the same watchdog, recovery and deferred-zone logic as a targeted recovery
+(`rescue_ranges`, with the zones cut out of the ranges):
+
+1. the first MiB of the disk (partition table), then the first 64 KiB of every partition (boot sectors);
+2. from each NTFS boot sector (`ntfs_geometry`: sector and cluster size, the `$MFT` and `$MFTMirr` clusters, the size
+   of an MFT record) the first MiB of the MFT and the mirror — enough for `fsstat` and `istat` to open the volume on a
+   partly read image;
+3. the data of `$Volume`, `$AttrDef` and `$UpCase` (`attr_ranges`, found by attribute number: until `$AttrDef` has
+   been read, TSK cannot name the attribute types and cannot find a directory index at all — a listing of such an
+   image shows nothing useful, which is also why an inventory of an early image is meaningless without this phase);
+4. all runs of `$MFT` (`file_byte_ranges 0`);
+5. the directory indexes: `fls -r -p -u -D` lists the directories that can be reached with what has been read so
+   far, `istat -r` gives the runs of their `$INDEX_ALLOCATION`, those are read, and the next pass reaches the
+   directories below (at most eight passes; small directories live inside the MFT);
+6. the data of the `--first` paths (`tsk_files` filtered by path, `file_byte_ranges`).
+
+The markers `meta.done` and `first.done` make the phase run once; a new `--first` path later reads just that path.
+When the volume is not NTFS (or the structures cannot be opened) the phase says so and the ordinary order follows.
 
 ## The watchdog
 
@@ -50,6 +92,32 @@ source it runs unwatched and says so. `--temp-cmd PROGRAM` replaces smartctl wit
 While rescuing, the kernel's command timeout of the disk (`/sys/block/X/device/timeout`, 30 s by default) is raised
 to 180 s and restored on exit: a disk without ERC re-reads a sector for a long time, the kernel resets the link
 after 30 s and, after a few resets, disables the disk.
+
+## The kernel's read-only flag
+
+`ddrescue` never writes to its input, but something else might: a desktop that auto-mounts the partition and replays
+a journal, an `fsck` started by hand. While rescuing, `blockdev --setro` is set on the source device (`set_readonly`);
+the original value is restored on exit. A disk that comes back is a new device and gets the flag again
+(`recover_device`). If the flag cannot be set the tool warns and goes on.
+
+## Status, events, the service
+
+The watchdog loop writes `NAME.logs/state` (state, phase, temperature, rescued bytes and the rate over a ten-minute
+window of the map — ddrescue's own rate log is written only when it exits) once per interval. `--status` combines it
+with the map (exact byte totals per block kind), the lock (a held lock means a rescue is running), the deferred zones
+and the tail of `rescue.log`. `notify` runs `--on-event PROGRAM` in the background with a 60 s limit and without a
+shell. `service_unit` prints a unit for the same command line: exit status 3 (power cycle) and 2 (stuck zones) are
+excluded from `Restart=`, and the unit is wanted by `multi-user.target`, so the first boot after the power cycle
+continues the rescue.
+
+## Triage
+
+`--triage` is a separate, read-only mode. It reads `smartctl -j -i -H -A` (plain, then `-d sat`), the kernel log
+(link resets of the disk's ATA port, I/O errors for the device) and nine 1 MiB samples with `O_DIRECT`. A sample that
+does not return in `--triage-timeout` seconds is abandoned (the process may stay in the kernel for its own timeout)
+and sampling stops; so it does after two failures in a row. Findings are graded — notes, warnings (SMART failing,
+pending or uncorrectable sectors, CRC errors, failed or slow samples, link problems) and red flags (the disk does not
+answer) — and the verdict follows the worst grade.
 
 ## A dropped disk
 
@@ -118,6 +186,14 @@ The Sleuth Kit parses the volume directly:
 
 The file system is detected with `fsstat`. If it is not NTFS, or the image has a partition table, the file level is
 skipped with a message; imaging itself works for anything.
+
+### Whole-disk images
+
+If `fsstat` does not recognise the image itself, `mmls` lists its partitions (`mmls_starts`, with the device's
+sector size, kept in `NAME.logs/sector-size` for runs without the disk), every partition is tested with `fsstat -o`,
+and the NTFS one is used (`fs_locate`; `--partition N` chooses among several). TSK takes the offset in 512-byte
+sectors (`TSK_O`); every byte position that comes out of the file level (ranges for classification, targeted and
+metadata-first reads, the stream of a file) includes `FS_OFFSET`.
 
 ### Preparing the image
 
@@ -192,6 +268,17 @@ repeat count is at most 65535, hence the nested form `(?:\x00{32768}){4}` for 12
 threshold are options. A long run of zeros is normal in sparse files and disk images, so this is a heuristic and the
 list is advice, not proof.
 
+### Garbage in the image (`--recheck-garbage`)
+
+`scan_garbage` runs `grep -aboP` over the image with a pattern wrapped in a lookahead, so that every match is one
+byte (the printed match of a pattern with NUL bytes or newlines would break the parsing); the offsets become
+sector-aligned ranges. The phase runs twice around a retry: the first time it marks the finished (`+`) parts of the
+map inside the ranges as bad (`mark_map_ranges`, an explicit rewrite of the blocks) and removes `retry.done`; the
+retry phase then reads those sectors again; the second time it scans again and keeps what is left in
+`garbage-ranges.txt`. `unread_ranges` adds that file to the unread ranges of the map, so `report`, `--inventory` and
+targeted recovery classify files that touch garbage as damaged. Zeros are not scanned for: unused space is full of
+them and marking it would send the disk to re-read gigabytes for nothing.
+
 ### Extraction
 
 - Files are written to `NAME.part` and renamed when the size matches the volume; the modification time is set from
@@ -200,6 +287,11 @@ list is advice, not proof.
   Size and time alone do not catch a copy whose write was cut short (a USB bridge that loses data on a disconnect):
   re-check the last files after such an event.
 - Files are written as `--owner` (via `runuser`) so that a setgid directory passes its group on.
+- With `--verify` the stream is hashed on the way (`tee` into `sha256sum`), then the file on the target is synced
+  (`sync FILE`), dropped from the page cache (`dd iflag=nocache count=0`), read back and hashed; a difference removes
+  the copy and fails the run at the end. Hashes go to `manifest.sha256` (`HASH  PATH`, the format of
+  `sha256sum -c`); a file already in place with the same size and time is compared with its manifest entry, or with
+  a hash computed from the image when there is none.
 
 ## Shell lessons built into the code
 

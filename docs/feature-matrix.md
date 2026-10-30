@@ -86,3 +86,21 @@ Every feature, the code that implements it (function names in `lastread`) and th
 | Image extended with `truncate` before TSK | `image_prepare` | I: `test_ntfs` |
 | Size and time do not catch a cut-short write | `extract_files`, README | — (documentation) |
 | The run lock is not inherited by children | `run_ddrescue`, `main` | I: `test_dm_phases` (re-run right after an interruption) |
+
+## Added after the first release candidate
+
+| Feature | Code | Tests |
+| --- | --- | --- |
+| Kernel read-only flag on the source while rescuing; restored on exit; set again on a returning disk; `--no-readonly` | `set_readonly`, `restore_readonly`, `recover_device` | I: `test_dm_phases`, `test_scsi_debug` |
+| Events (`--on-event`) with a message and an environment, never blocking | `notify` | U: `test_service`; I: `test_dm_phases`, `test_watchdog`, `test_hang_zones`, `test_safety` |
+| Exit status 3 for a power cycle; the other codes | `die_code`, `die_device` | U: `test_service`; I: `test_hang_zones`, `test_scsi_debug` |
+| systemd unit (`--print-service`), accepted by systemd | `service_unit`, `unit_arg` | U: `test_service`; I: `test_safety` (`systemd-analyze verify`) |
+| State file and progress sampling | `write_state`, `sample_progress` | U: `test_status`; I: `test_dm_phases` |
+| `--status` (text and JSON), without root | `status_run`, `map_totals`, `fmt_duration` | U: `test_status`; I: `test_dm_phases` |
+| `--triage`: SMART, kernel log, sample reads, verdict, exit status 4 | `triage_run`, `triage_smart_json`, `triage_read`, `triage_positions` | U: `test_triage`; I: `test_triage` |
+| File level on a whole-disk image: partition detection, `--partition`, offsets, 4096-byte sectors | `fs_locate`, `tsk_set_offset`, offsets in `classify`, `file_stream`, `file_byte_ranges` | U: `test_partition`; I: `test_ntfs` (DOS, two NTFS, GPT 4Kn) |
+| Metadata first: boot sector geometry, `$MFT`, directory indexes, `--first`, zones kept out | `meta_run`, `ntfs_geometry`, `dir_index_ranges`, `rescue_ranges`, `subtract_ranges` | U: `test_meta`; I: `test_ntfs` (a slow disk interrupted after the phase; whole-disk image; no NTFS) |
+| `--verify` with a manifest; files in place checked; a failing verification removes the copy | `write_stream`, `verify_file`, `existing_ok`, `manifest_add` | U: `test_tsk`; I: `test_ntfs` |
+| `--recheck-garbage`: scan, mark as bad, read again, keep what stays | `scan_garbage`, `mark_map_ranges`, `garbage_run`, `unread_ranges` | U: `test_garbage`; I: `test_garbage`, `test_ntfs` |
+| The kernel timeout is only raised | `raise_kernel_timeout`, `main` | I: `test_scsi_debug` |
+| File level for ext2/3/4 (extents, holes, inline data), FAT12/16/32 and exFAT; boot-sector recognition of FAT/exFAT | `fs_kind_of`, `fs_probe`, `boot_probe`, `file_map_blocks`, `file_map_normalize`, rules in `tsk_files` | U: `test_fs_kinds` (real ext4 `istat -r`), `test_partition`; I: `test_fs` (ext4, FAT32, exFAT: healthy, damaged, whole-disk) |

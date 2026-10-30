@@ -17,8 +17,27 @@ First version. Released under GPL-3.0-or-later.
   targeted recovery (`--file`, `--pick`), extraction (`--extract-to`, `--include`, `--map`, `--owner`), a workaround for
   the `$ATTRIBUTE_LIST` stitching error of The Sleuth Kit 4.12, and detection of silent garbage.
 
+- `--triage`: a read-only check of a disk before a rescue (SMART, kernel messages, nine sample reads) with a
+  verdict and suggested options.
+- `--status` (and `--json`): progress of a rescue from its map and logs, without touching the disk.
+- `--on-event PROGRAM` and `--print-service`: notifications, and a systemd unit that continues a rescue after a
+  power cycle. A new exit status 3 says that the disk needs a power cycle.
+- The source gets the kernel's read-only flag while rescuing (`--no-readonly` to leave it alone).
+- The file level works on a partition of a whole-disk image (`mmls`, `--partition N`), also with 4096-byte sectors.
+- The file level reads ext2/3/4 (extents, holes, inline data), FAT12/16/32 and exFAT as well as NTFS. FAT and exFAT
+  are recognised from the boot sector, because `fsstat` of The Sleuth Kit 4.12 does not return on exFAT.
+- `--verify`: extracted files are checked by SHA-256 after a sync and a cache drop; a manifest in `sha256sum -c`
+  format; files already in place are checked too.
+- `--recheck-garbage`: the image is scanned for the suspect pattern, the sectors are marked bad and read again,
+  what stays garbage counts as unreadable.
+- A metadata-first phase for NTFS (`$MFT`, directory indexes) and `--first PATH`; `--no-meta-first` to skip it.
+
 ### Behaviour worth knowing
 
+- The kernel command timeout is only raised to `--kernel-timeout`, never lowered.
+- The disk not answering and needing a power cycle is exit status 3 (it was 1).
+- On NTFS a rescue starts with the metadata-first phase. It reads the structures of the volume before the bulk, so
+  the order in which areas are read differs from a plain ddrescue run; use `--no-meta-first` for the plain order.
 - `--extract` extracts **intact** files only, in a normal run as well as after `--inventory` and in targeted recovery.
   `--extract-damaged` (normal run only) also extracts damaged files, their unreadable parts as zeros.
 - Directory entries that point to MFT entries that are readable and not in use (stale index records of deleted
@@ -53,4 +72,4 @@ First version. Released under GPL-3.0-or-later.
 ### Not included
 
 No repair of the disk, no writing to the source, no GUI, no Windows or macOS support; no file level for file systems
-other than NTFS; no USB reset.
+other than NTFS, ext2/3/4, FAT and exFAT; no metadata-first phase except for NTFS; no USB reset.

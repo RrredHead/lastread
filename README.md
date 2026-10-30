@@ -14,11 +14,18 @@ It is one bash script around `ddrescue`. What it adds:
 - **A dropped disk is handled.** ddrescue is stopped before it marks the whole remainder as bad (a vanished disk
   answers every read with an error, instantly). The traces are put back to "not tried" and, on SATA/SAS, the disk is
   brought back by rescanning its SCSI host — no power cycle.
-- **A file level for NTFS**, without mounting the image (The Sleuth Kit): which files are intact, which are damaged,
-  recovery of chosen files only, extraction of intact files with their original times, and detection of garbage the
-  disk returned *without* an error.
+- **The structures of the volume first.** On an NTFS volume the partition table, boot sector, `$MFT` and directory
+  indexes — and then the paths you name with `--first` — are read before the rest of the disk, because with a dying
+  disk the order of reading decides what survives.
+- **A file level for NTFS, ext2/3/4 and FAT/exFAT**, without mounting the image (The Sleuth Kit), also for a
+  whole-disk image with a partition table: which files are intact, which are damaged, recovery of chosen files only, extraction of intact
+  files with their original times, and detection of garbage the disk returned *without* an error.
+- **Made for long rescues.** `--triage` (a short read-only health check with a verdict), `--status` (progress without
+  touching the disk, also as JSON), `--on-event` (a program is run when the disk gets hot, drops, needs a power cycle,
+  …) and `--print-service` (a systemd unit that continues the rescue by itself after a power cycle).
 
-It does not repair anything and never writes to the source device.
+It does not repair anything and never writes to the source device; while rescuing it also sets the kernel's
+read-only flag on the source, so nothing else on the machine can modify the failing disk.
 
 ## When not to use it
 
@@ -75,7 +82,17 @@ To update a copy that is *running* a rescue, write the new version to a temporar
    The source must not be mounted. For a file-level recovery, image the **partition** (`...-part1`), not the whole
    disk.
 
-2. Image it. The directory must exist, have enough room for the whole device and be **on another physical disk**:
+2. *(Optional, recommended.)* A short look at the disk before you commit to a long run. It only reads:
+
+   ```bash
+   sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK-part1 --triage
+   ```
+
+   It prints the identity, SMART data (if the disk shows it), kernel messages about the disk and nine one-megabyte
+   sample reads, then a verdict — green, yellow or red — and suggested options. Red means the disk barely answers:
+   see "When not to use it".
+
+3. Image it. The directory must exist, have enough room for the whole device and be **on another physical disk**:
 
    ```bash
    sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK-part1 --dir /mnt/big/rescue
@@ -85,7 +102,7 @@ To update a copy that is *running* a rescue, write the new version to a temporar
    path unless you pass `--name`; for a name that can change, such as `/dev/sdb1`, `--name` is required, because the
    next run must find the same image). Stop it any time; run the same command to continue.
 
-3. Look at what is damaged, and take what is intact — the disk is no longer needed:
+4. Look at what is damaged, and take what is intact — the disk is no longer needed:
 
    ```bash
    sudo lastread --inventory --dir /mnt/big/rescue --name ata-EXAMPLE_DISK-part1 \
@@ -103,6 +120,7 @@ The phase is derived from the map every time, so there is nothing else to rememb
 
 | Phase | What happens |
 | --- | --- |
+| `meta` | NTFS only, once: the partition table, boot sectors, `$MFT`, directory indexes, then the data of the `--first` paths — read before everything else. Skipped for other file systems and with `--no-meta-first` or `--no-fs`. |
 | `copy` | ddrescue reads everything that reads fast; bad and slow places are skipped (`ddrescue -n`). Always restarted from pass 1 at the current position. |
 | `scrape` | skipped areas are read sector by sector |
 | `retry` | unreadable sectors are tried `--retries` more times |
@@ -110,17 +128,21 @@ The phase is derived from the map every time, so there is nothing else to rememb
 | `report` | summary; with the file level, the list of damaged files |
 | `extract` | with `--extract`: intact files are copied out of the image |
 
-Exit status: `0` done, `1` error, `2` only stuck deferred zones are left (see `--give-up-zones`), `130` interrupted.
+Exit status: `0` done, `1` error, `2` only stuck deferred zones are left (see `--give-up-zones`), `3` the disk does
+not answer and needs a power cycle, `130` interrupted. (`--triage` returns `4` for a red verdict.)
 
 Files in `NAME.logs/`: `rescue.log` (the run log), `events.log` and `rates-*.log` (ddrescue's event and rate logs),
-`ddrescue-PHASE.log` (its output), `zones` (the deferred zones), `scsi-host` (where to rescan), and the lists.
+`ddrescue-PHASE.log` (its output), `zones` (the deferred zones), `scsi-host` (where to rescan), `state` (what `--status`
+reads), `meta.done`/`first.done` (the metadata-first phase), and the lists.
 How the pieces work is described in [docs/how-it-works.md](docs/how-it-works.md).
 
 ## Options
 
 ```
 lastread SOURCE [options]
-lastread --inventory [--name NAME] [options]
+lastread --inventory | --status [--json] [--name NAME] [options]
+lastread SOURCE --triage
+lastread SOURCE [options] --print-service
 ```
 
 Run `lastread --help` for the full list with defaults. The groups:
@@ -146,13 +168,101 @@ set `ddrescue -a`, `-K`, `-r`, `-R` for the copy phase (and `--start-at` only fo
 `--owner USER[:GROUP]`, `--file-mode MODE` (0664), `--dir-mode MODE` (0775), `--extract-damaged`, `--inventory`,
 `--pick`, `--file PART` (repeatable), `--no-fs`.
 
-**Silent garbage** — `--suspect-pattern RE` (repeatable), `--suspect-zeros SIZE` (128Ki), `--no-suspect-check`.
+**Order** — `--first PATH` (repeatable): read this directory or file of the volume right after its structures;
+`--no-meta-first`: no metadata-first phase.
+
+**Whole-disk images** — `--partition N`: which partition of the image's table holds the volume when several hold a
+file system the file level can read.
+
+**Safety and notifications** — `--no-readonly` (do not set the kernel's read-only flag on the source), `--on-event
+PROGRAM` (default from `$LASTREAD_ON_EVENT`), `--print-service`.
+
+**Looking** — `--triage` and `--triage-timeout SEC` (20); `--status` and `--json`.
+
+**Silent garbage** — `--suspect-pattern RE` (repeatable), `--suspect-zeros SIZE` (128Ki), `--no-suspect-check`,
+`--recheck-garbage`.
+
+**Verification** — `--verify` (with `--extract`).
 
 **General** — `--dry-run`, `--help`, `--version`.
 
 Sizes accept `k`/`M`/`G`/`T` (powers of 1000) and `Ki`/`Mi`/`Gi`/`Ti` (powers of 1024).
 
 ## Recipes
+
+### Check the disk before a long run
+
+```bash
+sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK --triage
+```
+
+The check reads nine 1 MiB samples (the start, seven points between, the end) with `--triage-timeout` seconds each,
+stops after two failures in a row or after one read that does not return, and never reads more. A sample read is
+still a read on a sick disk; that is why it is short. The verdict is a heuristic: green is "nothing alarming in this
+short check", yellow is "workable, expect trouble", red is "the disk barely answers" (exit status 4). The SMART part
+is read from `smartctl -j` (a plain call, then `-d sat` for a disk behind a USB bridge); it was written to the
+documented JSON layout and is tested on prepared documents, not on real drives.
+
+### Watch a long rescue
+
+A rescue takes days and sometimes stops for a power cycle. Three tools help:
+
+```bash
+lastread --status --dir /mnt/big/rescue --name old-disk          # no root, does not touch the disk
+lastread --status --json --dir /mnt/big/rescue --name old-disk   # for monitoring (needs jq)
+sudo lastread DISK --dir /mnt/big/rescue --on-event ~/notify.sh  # a program is run on events
+```
+
+`--status` shows whether the rescue is running, the next phase, the rescued share, the unread and unreadable
+amounts, the rate over the last ten minutes with a rough time left, the temperature, the deferred zones and the last
+log lines. `--on-event PROGRAM` runs `PROGRAM EVENT MESSAGE` (no shell; the environment has `LASTREAD_EVENT`,
+`LASTREAD_MESSAGE`, `LASTREAD_NAME`, `LASTREAD_DIR`, `LASTREAD_STATUS`) in the background on: `started`, `hot`,
+`cooled`, `dropped`, `recovered`, `power-cycle`, `zones-stuck`, `phase-done`, `done`, `interrupted`, `failed`. A
+failing program never stops the rescue.
+
+To continue by itself after a power cycle, let systemd run it:
+
+```bash
+lastread DISK --dir /mnt/big/rescue --name old-disk --print-service | sudo tee /etc/systemd/system/lastread-old-disk.service
+sudo systemctl daemon-reload && sudo systemctl enable --now lastread-old-disk.service
+```
+
+The unit restarts the tool after an ordinary failure (a few times), but not after exit status 3 (a power cycle is
+needed — it starts again at the next boot), 2 (stuck zones — a decision is needed) or a stop by `systemctl`. When the
+rescue is finished: `systemctl disable lastread-old-disk.service`.
+
+### Important files first
+
+```bash
+sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK-part1 --dir /mnt/big/rescue --first 'Documents' --first 'Photos/2019'
+```
+
+On an NTFS volume the structures needed to know the files are read first (`meta` phase), then the data of the
+given paths, then the rest. Without `--first` the structures are still read first; `--no-meta-first` switches the
+phase off. The deferred zones stay out of this phase: a place where the disk hangs is set aside, as always. On a
+volume that is not NTFS the phase says so and the ordinary order follows.
+
+### A whole disk instead of a partition
+
+```bash
+sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK --dir /mnt/big/rescue --name old-disk --extract --extract-to /mnt/recovered
+```
+
+If the image has a partition table, the only partition with a file system the file level can read (NTFS, ext2/3/4,
+FAT, exFAT) is found and used (through `mmls`); with several, the
+tool says so and `--partition N` chooses (N counts the partitions as `/dev/sdX1`, `/dev/sdX2`, … do). Other file
+systems are imaged normally and the file level says why it is skipped.
+
+### Garbage that the disk returns without an error
+
+Extraction already lists files with suspicious data (see the tip on silent garbage). With `--recheck-garbage` the
+tool goes further: once, after copy, scrape and retry, it scans the *image* for the suspect pattern (the `sEDU`
+service sector, or your `--suspect-pattern`; the zero-run check is not used here, because zeros are normal in
+unused space), marks those sectors as unreadable so that the retry phase asks the disk for them again — a worn disk
+sometimes answers correctly the second time — and scans once more. What still looks like garbage is kept in
+`NAME.logs/garbage-ranges.txt` and counts as unreadable: files that touch it are damaged and are not extracted.
+It works for any file system; it reads the whole image once, which takes as long as `grep` needs for the size of
+the disk.
 
 ### Just take an image
 
@@ -241,7 +351,10 @@ damaged: run the same command with `--give-up-zones`.
   `libata.force=N:1.5Gbps` (`N` is the ATA port number from `dmesg | grep -i 'ata[0-9]'`; see the kernel's
   `kernel-parameters.txt` for the syntax). Remove it afterwards.
 - **Cold power-off:** if a disk drops and does not come back by rescanning, do a full power-off (not a reboot),
-  wait, power on and run the same command again.
+  wait, power on and run the same command again (or let `--print-service` do the last step).
+- **The read-only flag.** While rescuing, the source is read-only for the kernel (`blockdev --setro`): a mount, an
+  `fsck` or a write by mistake fails instead of altering the failing disk. The old value is restored on exit; a disk
+  that comes back under a new name gets the flag again. `--no-readonly` turns it off.
 - **Silent garbage.** Some failing disks return something else instead of data and report no error, so ddrescue
   counts the place as read. Extraction checks the data stream and lists such files in `suspicious-files.txt`
   (they are still extracted): a 512-byte service sector tagged `sEDU` at both ends (seen on a failing 2.5" SMR drive)
@@ -249,17 +362,23 @@ damaged: run the same command with `--give-up-zones`.
   databases: raise `--suspect-zeros SIZE` or turn the check off (`--suspect-zeros 0`, `--no-suspect-check`).
   Replace the pattern with `--suspect-pattern RE` (`grep -P`, bytes).
 - **Check the target after an abrupt disconnect.** Skipping "already extracted" files by size and time does not
-  catch a file whose write was cut short (for example a USB bridge that drops data on a disconnect). If the
-  extraction target went away in the middle of a run, extract the last files again into a scratch directory and
-  compare them with `cmp`, or delete them and extract again.
+  catch a file whose write was cut short (for example a USB bridge that drops data on a disconnect). Use
+  `--verify`: every extracted file is synced, dropped from the cache, read back and compared by SHA-256 with what
+  the image gave, the hashes go to `NAME.logs/manifest.sha256` (`cd TARGET && sha256sum -c MANIFEST` checks them
+  later, anywhere), and files that are already in place are checked the same way — against the manifest, or else
+  against the image — and extracted again if they differ.
 - **Run it in `tmux`/`screen`** and keep the image on a disk with free space for the entire device.
 - **The image is sparse** and grows as the disk is read; `truncate` is used to give it the size of the device.
 
 ## Limitations
 
-- The file level supports NTFS only (resident, ordinary, sparse, compressed and heavily fragmented files). Other file
-  systems and whole-disk images with a partition table are imaged normally and the file level says why it is
-  skipped. The code is structured so that other file systems understood by The Sleuth Kit can be added later; this
+- The file level supports NTFS (resident, ordinary, sparse, compressed and heavily fragmented files), ext2/3/4
+  (extents, holes, inline data), FAT12/16/32 and exFAT, on a partition image or on a partition of a whole-disk
+  image. The metadata-first phase and the search for entries that the directory walk does not reach are NTFS and
+  ext only; FAT/exFAT volumes are listed by the walk. Timestamps of FAT are stored without a time zone and are
+  taken as UTC. Other file systems (btrfs, XFS, APFS, …) are imaged normally and the file level says why it is
+  skipped. Other file systems are imaged normally and the file
+  level says why it is skipped. The code is structured so that other file systems understood by The Sleuth Kit can be added later; this
   version does not promise them.
 - Named streams and system files (`$…`) are not listed; file names containing a tab character cannot be put in the
   lists and are reported as `?/entry N`.
@@ -276,7 +395,7 @@ damaged: run the same command with `--give-up-zones`.
 tests/lint.sh                 # ShellCheck and style rules
 tests/unit/run.sh             # unit tests: no root, no devices
 tests/vm.sh create            # create a Multipass VM with the dependencies
-tests/vm.sh integration       # device-mapper, scsi_debug and NTFS tests, as root in the VM
+tests/vm.sh integration       # device-mapper, scsi_debug, NTFS, ext4, FAT32 and exFAT tests, as root in the VM
 ```
 
 The integration tests create and destroy block devices: run them in a VM, never on a machine whose disks matter.
