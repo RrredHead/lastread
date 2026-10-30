@@ -55,7 +55,8 @@ power_cycle() {
 
 D="$W/out"
 mkdir -p "$D"
-opts=(--dir "$D" --name hang --interval 1 --no-temp --no-fs --zone-margin 1Mi --zone-min-progress 256Ki --rescan-pause 1)
+hook="$(mk_hook hang)"
+opts=(--dir "$D" --name hang --interval 1 --no-temp --no-fs --zone-margin 1Mi --zone-min-progress 256Ki --rescan-pause 1 --on-event "$hook")
 
 runs=0
 while ((runs < 12)); do
@@ -63,13 +64,18 @@ while ((runs < 12)); do
   tool "$disk" "${opts[@]}"
   printf 'run %d: exit %d\n' "$runs" "$RC"
   grep -E 'the disk hung|deferred zone|almost no progress|does not answer|zones-stuck|deferred zones remain' "$OUT" | sed 's/^/        /'
-  if ((RC == 1)) && out_has "does not answer"; then
+  if ((RC == 3)) && out_has "does not answer"; then
     power_cycle
     continue
   fi
   break
 done
 rc_is "the tool ends with 'only stuck zones are left'" 2
+sleep 1
+check "events: the disk dropped" bash -c "events_list=\$(cut -d'|' -f1 '$W/events-hang.log'); [[ \$events_list == *dropped* ]]"
+check "events: a power cycle was asked for" bash -c "events_list=\$(cut -d'|' -f1 '$W/events-hang.log'); [[ \$events_list == *power-cycle* ]]"
+check "events: stuck zones were reported" bash -c "events_list=\$(cut -d'|' -f1 '$W/events-hang.log'); [[ \$events_list == *zones-stuck* ]]"
+eq "the state file says zones-stuck" zones-stuck "$(sed -n 's/^state=//p' "$D/hang.logs/state")"
 check "the tool says which zones are stuck" out_has "deferred zones remain that the disk does not read from either side"
 check "it took several runs (a hang, then narrowing)" test "$runs" -ge 5
 check "zones were deferred around the hang" grep -F "deferred zones —" "$D/hang.logs/rescue.log"

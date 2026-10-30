@@ -116,3 +116,14 @@ rc_is() {
     fail "$1" "expected exit status $2, got $RC; output tail:"$'\n'"$(tail -15 "$OUT")"
   fi
 }
+# mk_hook TAG: an --on-event program that appends "EVENT|NAME|STATUS" lines to $W/events-TAG.log;
+# prints the path of the program.
+mk_hook() {
+  local h="$W/hook-$1"
+  # shellcheck disable=SC2016 # the program text is written literally
+  printf '#!/bin/sh\nprintf "%%s|%%s|%%s\\n" "$1" "$LASTREAD_NAME" "$LASTREAD_STATUS" >>"%s"\n' "$W/events-$1.log" >"$h"
+  chmod +x "$h"
+  printf '%s' "$h"
+}
+# events_of TAG: the event names recorded by mk_hook, one per line, in the order of arrival.
+events_of() { cut -d'|' -f1 "$W/events-$1.log" 2>/dev/null; }

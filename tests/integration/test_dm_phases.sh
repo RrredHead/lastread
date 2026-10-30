@@ -72,10 +72,23 @@ slow="$(dm_create slow "$(dm_delay "$loop" 0 $((16 * M)) 40)" "$(dm_linear "$loo
 "$TOOL" "$slow" "${c2[@]}" >"$W/resume1.out" 2>&1 &
 pid=$!
 sleep 3
+dm_node="$(readlink -f "$slow")"
+tool --status --dir "$D2" --name resume
+rc_is "--status of a running rescue" 0
+check "...says it is running" out_has "state:          running"
+check "...and what comes next" out_has "next phase:     copy"
+if command -v jq >/dev/null; then
+  "$TOOL" --status --json --dir "$D2" --name resume >"$W/status.json" 2>&1
+  eq "--status --json: running" true "$(jq .running "$W/status.json")"
+  eq "--status --json: the name" resume "$(jq -r .name "$W/status.json")"
+fi
+eq "while rescuing, the source is read-only for the kernel" 1 "$(blockdev --getro "$dm_node")"
 check "while running the machine is kept awake (systemd-inhibit)" bash -c "systemd-inhibit --list --no-pager | grep -F lastread >/dev/null"
 kill -TERM "$pid"
 wait "$pid"
 eq "an interruption (SIGTERM; SIGINT is handled the same way) ends the run with 130" 130 "$?"
+eq "after the run the read-only flag is back to what it was" 0 "$(blockdev --getro "$dm_node")"
+eq "the state file says the run stopped" stopped "$(sed -n 's/^state=//p' "$D2/resume.logs/state")"
 check "...and says to run again" grep -F "interrupted" "$W/resume1.out"
 check "the map was saved" test -s "$D2/resume.map"
 part="$(ddrescuelog -t "$D2/resume.map" | sed -n 's/^ *rescued: *\([^,]*\),.*/\1/p')"
@@ -83,6 +96,19 @@ check "something, but not everything, was rescued before the interruption" test 
 tool "$slow" "${c2[@]}"
 rc_is "the next run finishes" 0
 check "...with the same image" same_bytes "$src" "$D2/resume.img" 0 $SIZE
+
+# --- --no-readonly leaves the flag alone; events are reported
+D4="$W/out4"
+mkdir -p "$D4"
+hook="$(mk_hook phases)"
+"$TOOL" "$slow" --dir "$D4" --name events --interval 1 --no-temp --no-fs --no-readonly --on-event "$hook" >"$W/events.out" 2>&1 &
+pid=$!
+sleep 2.5
+eq "--no-readonly: the flag stays off while rescuing" 0 "$(blockdev --getro "$dm_node")"
+wait "$pid"
+sleep 1
+eq "the events of a normal run: started, phase-done, done" "started,phase-done,done" "$(events_of phases | uniq | paste -sd, | sed 's/phase-done,phase-done/phase-done/')"
+eq "the state file says done" "done" "$(sed -n 's/^state=//p' "$D4/events.logs/state")"
 
 # --- option smoke test: the image comes out right with unusual options
 D3="$W/out3"

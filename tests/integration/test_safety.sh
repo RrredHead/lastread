@@ -26,14 +26,29 @@ S
 chmod +x "$W/shim/ddrescue"
 D="$W/a"
 mkdir -p "$D"
-SHIM_EXIT=1 PATH="$W/shim:$PATH" tool "$disk" --dir "$D" --name failing --interval 1 --no-temp --no-fs
+hook="$(mk_hook safety)"
+SHIM_EXIT=1 PATH="$W/shim:$PATH" tool "$disk" --dir "$D" --name failing --interval 1 --no-temp --no-fs --on-event "$hook"
 rc_is "ddrescue failing five times in a row without progress stops the tool" 1
 check "...with that message" out_has "ddrescue failed five times in a row without progress"
+sleep 1
+check "the event 'failed' was sent" bash -c "grep -F 'failed|' '$W/events-safety.log' >/dev/null"
+eq "the state file says failed" failed "$(sed -n 's/^state=//p' "$D/failing.logs/state")"
 D="$W/b"
 mkdir -p "$D"
 SHIM_EXIT=0 PATH="$W/shim:$PATH" tool "$disk" --dir "$D" --name stalling --interval 1 --no-temp --no-fs
 rc_is "a phase that ends three times without progress stops the tool" 1
 check "...with that message" out_has "ended three times in a row without progress"
+
+# === the systemd unit is accepted by systemd ====================================================================
+if command -v systemd-analyze >/dev/null; then
+  "$TOOL" /dev/disk/by-id/x --dir "$D" --name unit-test --on-event "$W/shim/ddrescue" --print-service >"$W/lastread-unit-test.service"
+  chmod 644 "$W/lastread-unit-test.service"
+  systemd-analyze verify "$W/lastread-unit-test.service" >"$OUT" 2>&1
+  RC=$?
+  rc_is "systemd-analyze verify accepts the generated unit" 0
+else
+  skip "systemd-analyze is not available"
+fi
 
 # === the image directory and the extraction directory must not be on the failing disk =========================
 truncate -s $((64 * M)) "$W/two.img"

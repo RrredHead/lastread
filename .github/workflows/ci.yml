@@ -42,7 +42,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs smartmontools whiptail
+          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs exfatprogs dosfstools smartmontools whiptail
           sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra: scsi_debug tests will be skipped"
       - name: Integration tests
         run: sudo tests/integration/run.sh

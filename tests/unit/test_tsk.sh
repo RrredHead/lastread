@@ -363,6 +363,48 @@ check "--map renames the destination" test -f "$extract_to/renamed/deep/c.bin"
 check "--map drops what it does not match" test ! -e "$extract_to/movies/a.bin"
 maps=()
 
+# --- --verify: hashes, the manifest, a file changed in place, a failing verification
+verify=1 MANIFEST="$logs/manifest.sha256" STREAM_SHA="$T/stream.sha"
+rm -rf "${extract_to:?}"/*
+rm -f "$MANIFEST"
+out="$(extract_files "$T/files.tsv" 1)"
+check "verify: the summary names the verified files" contains "$out" "verified by SHA-256: 2 new files"
+want="$(sha256sum "$T/a.expect" | cut -d' ' -f1)"
+eq "verify: the manifest has the hash in sha256sum format" "$want  movies/a.bin" "$(grep ' movies/a.bin$' "$MANIFEST")"
+check "verify: the manifest passes sha256sum -c" bash -c "cd '$extract_to' && sha256sum -c --quiet '$MANIFEST'"
+out="$(extract_files "$T/files.tsv" 1)"
+check "verify: files in place are checked and kept" contains "$out" "already in place: 2"
+# a copy changed in place with the same size and time (a write cut short, a bad bridge)
+epoch="$(stat -c %Y "$extract_to/movies/a.bin")"
+printf 'Z' | dd of="$extract_to/movies/a.bin" bs=1 seek=100 conv=notrunc status=none
+touch -d "@$epoch" "$extract_to/movies/a.bin"
+verify=0
+extract_files "$T/files.tsv" 1 >/dev/null
+check "without --verify the changed copy goes unnoticed (size and time match)" bash -c "! cmp -s '$extract_to/movies/a.bin' '$T/a.expect'"
+verify=1
+out="$(extract_files "$T/files.tsv" 1)"
+check "with --verify it is found" contains "$out" "extracting it again"
+check "...and extracted again, correctly" cmp -s "$extract_to/movies/a.bin" "$T/a.expect"
+# a file without a manifest entry is checked against the image
+grep -v ' movies/a.bin$' "$MANIFEST" >"$MANIFEST.new"
+mv "$MANIFEST.new" "$MANIFEST"
+printf 'Z' | dd of="$extract_to/movies/a.bin" bs=1 seek=100 conv=notrunc status=none
+touch -d "@$epoch" "$extract_to/movies/a.bin"
+out="$(extract_files "$T/files.tsv" 1)"
+check "...also without a manifest entry (against the image)" contains "$out" "extracting it again"
+check "...and corrected" cmp -s "$extract_to/movies/a.bin" "$T/a.expect"
+# a verification that fails: the copy is removed and the run fails
+# shellcheck disable=SC2317 # called indirectly by extract_files
+sha256sum() { if [[ ${1:-} == -- ]]; then echo "0000  $2"; else command sha256sum "$@"; fi; }
+rm -rf "${extract_to:?}"/*
+rm -f "$MANIFEST"
+( extract_files "$T/files.tsv" 1 ) >"$T/verify-fail.out" 2>&1
+eq "a failed verification fails the run" 1 "$?"
+check "...says so" contains "$(cat "$T/verify-fail.out")" "VERIFICATION FAILED"
+check "...and removes the copy" test ! -e "$extract_to/movies/a.bin"
+unset -f sha256sum
+verify=0
+
 # --- dest_for --------------------------------------------------------------------------------------------
 extract_to=/out includes=() maps=()
 eq "dest_for: the tree is preserved" "/out/a/b.txt" "$(dest_for a/b.txt)"

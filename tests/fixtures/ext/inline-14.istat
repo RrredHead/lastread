@@ -1,0 +1,15 @@
+inode: 14
+Allocated
+Group: 0
+Generation Id: 0
+uid / gid: 1000 / 1000
+mode: rrw-rw-r--
+Flags: Inline Data, 
+size: 5
+num of links: 1
+
+Inode Times:
+Accessed:	2024-03-05 18:53:36.000000000 (UTC)
+File Modified:	2024-03-05 18:53:36.000000000 (UTC)
+Inode Modified:	2024-03-05 18:53:36.000000000 (UTC)
+File Created:	2024-03-05 18:53:57.000000000 (UTC)

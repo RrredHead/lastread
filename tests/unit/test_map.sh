@@ -13,7 +13,7 @@ T="$(mktemp -d)"
 trap 'rm -rf "${T:?}"' EXIT
 map="$T/m.map" logs="$T/logs" zones="$T/logs/zones" domain="$T/logs/domain.map" LOG="$T/logs/rescue.log"
 mkdir -p "$logs"
-SECTOR=512 PART_SIZE=10000000000
+SECTOR=512 PART_SIZE=10000000000 meta_first=0 TMPD="$T"
 clean_state() { rm -f "${logs:?}"/*.done "${logs:?}"/zones "${logs:?}"/zones.abandoned "${domain:?}"; }
 
 # --- map_size, map_ranges

@@ -41,7 +41,8 @@ epoch() { date -d "$(sed -n "s/^\\([0-9-]* [0-9:]*\\) $1.*/\\1/p" "$D/wd.logs/re
   date +%s >"$W/set44"
 ) &
 IT_BG+=("$!")
-tool "$disk" --dir "$D" --name wd --interval 1 --stop 50 --resume 45 --temp-cmd "$W/sensor" --no-fs
+hook="$(mk_hook wd)"
+tool "$disk" --dir "$D" --name wd --interval 1 --stop 50 --resume 45 --temp-cmd "$W/sensor" --no-fs --on-event "$hook"
 rc_is "the run with a hot disk finishes" 0
 check "the sensor is announced" out_has "temperature from $W/sensor"
 check "ddrescue was stopped at 60 °C" out_has "stopping ddrescue, the map is saved"
@@ -49,6 +50,9 @@ check "the tool waited for the disk to cool down" out_has "cooling down: "
 check "the tool continued after the temperature dropped" out_has "continuing"
 eq "the copy phase was started twice (before and after the pause)" 2 "$(grep -c 'phase copy:' "$D/wd.logs/rescue.log")"
 check "the image equals the disk" same_bytes "$src" "$D/wd.img" 0 $SIZE
+sleep 1
+check "the event 'hot' was sent" bash -c "grep -x hot <(cut -d'|' -f1 '$W/events-wd.log') >/dev/null"
+check "the event 'cooled' was sent after it" bash -c "events=\$(cut -d'|' -f1 '$W/events-wd.log' | paste -sd,); [[ \$events == *hot*cooled* ]]"
 paused="$(epoch ".*stopping ddrescue")"
 resumed="$(epoch ".*temperature 44")"
 check "hysteresis: no resume before the temperature fell to --resume (47 °C is not enough)" test "$((resumed - paused))" -ge 7

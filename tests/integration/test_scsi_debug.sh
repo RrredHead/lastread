@@ -69,9 +69,13 @@ host="$(readlink -f "/sys/block/$SD/device" | grep -o 'host[0-9]*' | tail -1)"
 check "the test disk has a SCSI host" test -n "$host"
 orig_timeout="$(cat "/sys/block/$SD/device/timeout")"
 
+expected_timeout=$((orig_timeout < 180 ? 180 : orig_timeout))
 (
-  # during the run: the kernel timeout must be 180; then drop the disk
-  sleep 2
+  # during the run the kernel timeout must be 180 (or what it was, if that is more); then drop the disk
+  for _ in $(seq 1 60); do
+    [[ "$(cat "/sys/block/$SD/device/timeout")" == "$expected_timeout" ]] && break
+    sleep 0.5
+  done
   cat "/sys/block/$SD/device/timeout" >"$W/timeout-during"
   sleep 1
   echo 1 >"/sys/block/$SD/device/delete"
@@ -84,7 +88,7 @@ check "the traces were reverted" out_has "returned to \"not tried\""
 check "the disk was brought back by rescanning its host" out_has "rescanning $host"
 check "the disk is back" out_has "the disk is back"
 check "the image equals the disk" same_bytes "$src" "$D/drop.img" 0 $((SIZE_MB * M))
-eq "the kernel timeout was 180 while rescuing" 180 "$(cat "$W/timeout-during")"
+eq "the kernel timeout was raised to 180 while rescuing (never lowered)" "$expected_timeout" "$(cat "$W/timeout-during")"
 new_sd="$(sd_name)"
 eq "the kernel timeout is restored afterwards" "$orig_timeout" "$(cat "/sys/block/$new_sd/device/timeout")"
 eq "the SCSI host is remembered in the logs" "$host" "$(cat "$D/drop.logs/scsi-host")"
@@ -116,7 +120,7 @@ mkdir -p "$D3"
 ) &
 IT_BG+=("$!")
 tool "$BYID" --dir "$D3" --name norescan --interval 1 --no-temp --no-fs --no-rescan
-rc_is "--no-rescan: the run stops" 1
+rc_is "--no-rescan: the run stops with exit status 3 (power cycle needed)" 3
 check "...asks for a power cycle" out_has "Power the machine fully off"
 check "...and says rescanning is off" out_has "rescanning is off"
 # bring it back for the next scenario and finish the image

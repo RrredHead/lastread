@@ -77,6 +77,23 @@ RC=$?
 rc_is "A: an inventory needs no root" 0
 check "A: ...and finds the files" out_has "rescued whole: ${#REF_FILES[@]}, incomplete: 0"
 
+# --verify: hashes in a manifest, and a copy changed in place is found
+OUTV="$W/outv"
+mkout "$OUTV"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root --verify
+rc_is "A: extraction with --verify" 0
+check "A: ...everything was verified" out_has "verified by SHA-256: ${#REF_FILES[@]} new files"
+check "A: ...the manifest passes sha256sum -c" bash -c "cd '$OUTV' && sha256sum -c --quiet '$D/vol.logs/manifest.sha256'"
+epoch="$(stat -c %Y "$OUTV/media/movie1.mkv")"
+printf 'Z' | dd of="$OUTV/media/movie1.mkv" bs=1 seek=12345 conv=notrunc status=none
+touch -d "@$epoch" "$OUTV/media/movie1.mkv"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root
+check "A: without --verify the changed copy is left (size and time match)" bash -c "! cmp -s '$REF/media/movie1.mkv' '$OUTV/media/movie1.mkv'"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root --verify
+rc_is "A: with --verify the run repairs it" 0
+check "A: ...the changed copy was noticed" out_has "extracting it again"
+check "A: ...and extracted again, byte for byte" cmp -s "$REF/media/movie1.mkv" "$OUTV/media/movie1.mkv"
+
 # --include / --map
 OUTI="$W/outi"
 mkout "$OUTI"
@@ -199,20 +216,31 @@ rc_is "D2: an inventory of an image that ends early works" 0
 eq "D2: the image was extended (sparse) to the size of the partition" $SIZE "$(stat -c %s "$D/short.img")"
 check "D2: files are listed" out_has "files in the image:"
 
+# garbage found in the image makes the files that touch it damaged
+OUTD3="$W/outd3"
+D3="$W/d3"
+mkout "$OUTD3" "$D3"
+tool "$diskg" --dir "$D3" --name garbage --interval 1 --no-temp --recheck-garbage --extract --extract-to "$OUTD3"
+rc_is "D: --recheck-garbage on a volume with a service sector inside a file" 0
+check "D: the file with the service sector is damaged" grep -Fx "docs/my file with spaces.bin" "$D3/garbage.logs/damaged-files.txt"
+check "D: ...and is not extracted" test ! -e "$OUTD3/docs/my file with spaces.bin"
+check "D: the file with only a long run of zeros is not touched by the scan" test -f "$OUTD3/media/sub/clip.bin"
+
 # === E. other file systems and partition tables ===============================================================
-truncate -s $((32 * M)) "$W/ext4.img"
-mkfs.ext4 -q -F "$W/ext4.img" >/dev/null 2>&1
-loope="$(loop_attach "$W/ext4.img")"
-diske="$(dm_create ext4 "$(dm_linear "$loope" 0 $((32 * M)))")"
+# a volume with a file system the file level cannot read (minix): imaged, the file level is skipped
+truncate -s $((32 * M)) "$W/minix.img"
+mkfs.minix "$W/minix.img" >/dev/null 2>&1
+loope="$(loop_attach "$W/minix.img")"
+diske="$(dm_create minix "$(dm_linear "$loope" 0 $((32 * M)))")"
 D="$W/e"
 OUTE="$W/oute"
 mkout "$D" "$OUTE"
-tool "$diske" --dir "$D" --name ext4 --interval 1 --no-temp --extract --extract-to "$OUTE"
-rc_is "E: an ext4 disk is imaged" 0
-check "E: the file level is skipped with a clear message" bash -c "grep -E 'file system is .*: the file level supports NTFS only' '$OUT' >/dev/null"
-check "E: the image equals the disk" cmp -s "$W/ext4.img" "$D/ext4.img"
-check "E: the skipped file level does not leave a report to redo" test -e "$D/ext4.logs/report.done"
-tool --inventory --dir "$D" --name ext4
+tool "$diske" --dir "$D" --name minix --interval 1 --no-temp --extract --extract-to "$OUTE"
+rc_is "E: a disk with an unsupported file system is imaged" 0
+check "E: the file level is skipped with a clear message" out_has "holds no file system the file level can read"
+check "E: the image equals the disk" cmp -s "$W/minix.img" "$D/minix.img"
+check "E: the skipped file level does not leave a report to redo" test -e "$D/minix.logs/report.done"
+tool --inventory --dir "$D" --name minix
 rc_is "E: an explicit --inventory on a file system without a file level fails" 1
 check "E: ...with a message" out_has "no file level for this image"
 eq "E: nothing is extracted" 0 "$(find "$OUTE" -type f | wc -l)"
@@ -224,6 +252,136 @@ D="$W/e2"
 mkdir -p "$D"
 tool "$diskp" --dir "$D" --name parted --interval 1 --no-temp --extract --extract-to "$OUTE"
 rc_is "E: a whole disk with a partition table is imaged" 0
-check "E: ...with a hint to image the partition" out_has "the image has a partition table"
+check "E: ...and says that no partition holds a supported file system" out_has "no partition with a supported file system in the image"
+
+# === F. whole-disk images: the NTFS volume is found through the partition table =================================
+# one NTFS partition and one with no recognisable file system
+truncate -s $((1 + 96 + 8 + 1))M "$W/whole1.img"
+dd if="$VOL" of="$W/whole1.img" bs=1M seek=1 conv=notrunc status=none
+head -c 8M /dev/urandom | dd of="$W/whole1.img" bs=1M seek=97 conv=notrunc status=none # a partition with no file system
+printf 'label: dos\nstart=2048, size=196608, type=7\nstart=198656, size=16384, type=83\n' | sfdisk -q "$W/whole1.img" >/dev/null 2>&1
+loopw="$(loop_attach "$W/whole1.img")"
+diskw="$(dm_create whole1 "$(dm_linear "$loopw" 0 $(((1 + 96 + 8 + 1) * M)))")"
+D="$W/f1"
+OUTF="$W/outf1"
+mkout "$D" "$OUTF"
+tool "$diskw" --dir "$D" --name whole1 --interval 1 --no-temp --extract --extract-to "$OUTF"
+rc_is "F: a whole-disk image with one NTFS partition: image, report, extraction" 0
+check "F: the partition is found" out_has "the file level works on partition 1 of the image"
+diffs="$(compare_tree "$REF" "$OUTF")"
+eq "F: every file is extracted from the partition, byte for byte" "" "$diffs"
+tool --inventory --dir "$D" --name whole1
+rc_is "F: an inventory of the whole-disk image" 0
+check "F: ...finds all files whole" out_has "rescued whole: ${#REF_FILES[@]}, incomplete: 0"
+
+# two NTFS partitions: --partition decides
+truncate -s $((1 + 96 + 96 + 1))M "$W/whole2.img"
+dd if="$VOL" of="$W/whole2.img" bs=1M seek=1 conv=notrunc status=none
+dd if="$VOL" of="$W/whole2.img" bs=1M seek=97 conv=notrunc status=none
+printf 'label: dos\nstart=2048, size=196608, type=7\nstart=198656, size=196608, type=7\n' | sfdisk -q "$W/whole2.img" >/dev/null 2>&1
+loopw2="$(loop_attach "$W/whole2.img")"
+diskw2="$(dm_create whole2 "$(dm_linear "$loopw2" 0 $(((1 + 96 + 96 + 1) * M)))")"
+D="$W/f2"
+OUTF2="$W/outf2"
+mkout "$D" "$OUTF2"
+tool "$diskw2" --dir "$D" --name whole2 --interval 1 --no-temp --extract --extract-to "$OUTF2"
+rc_is "F: two NTFS partitions: the disk is imaged anyway" 0
+check "F: ...the file level asks to choose" out_has "choose one with --partition N"
+tool --inventory --dir "$D" --name whole2
+rc_is "F: an explicit --inventory without --partition fails" 1
+tool --inventory --dir "$D" --name whole2 --partition 2 --extract --extract-to "$OUTF2"
+rc_is "F: with --partition 2" 0
+diffs="$(compare_tree "$REF" "$OUTF2")"
+eq "F: the second volume is extracted byte for byte" "" "$diffs"
+
+# 4096-byte logical sectors and a GPT
+truncate -s $((1 + 96 + 1))M "$W/whole3.img"
+loop4="$(loop_attach "$W/whole3.img" --sector-size 4096)"
+printf 'label: gpt\nstart=1MiB, size=96MiB, type=EBD0A0A2-B9E5-4433-87C0-68B6B72699C7\n' | sfdisk -q "$loop4" >/dev/null 2>&1
+dd if="$VOL" of="$W/whole3.img" bs=1M seek=1 conv=notrunc status=none
+disk4="$(dm_create whole3 "$(dm_linear "$loop4" 0 $(((1 + 96 + 1) * M)))")"
+if [[ "$(blockdev --getss "$disk4")" == 4096 ]]; then
+  D="$W/f3"
+  OUTF3="$W/outf3"
+  mkout "$D" "$OUTF3"
+  tool "$disk4" --dir "$D" --name whole3 --interval 1 --no-temp --extract --extract-to "$OUTF3"
+  rc_is "F: a GPT disk with 4096-byte sectors: image, report, extraction" 0
+  check "F: ...ddrescue got the sector size" out_has "-b 4096"
+  check "F: ...the partition is found" out_has "the file level works on partition 1 of the image"
+  diffs="$(compare_tree "$REF" "$OUTF3")"
+  eq "F: ...every file extracted byte for byte" "" "$diffs"
+  tool --inventory --dir "$D" --name whole3
+  rc_is "F: an inventory of a 4096-sector image finds the partition again (sector size from the logs)" 0
+else
+  skip "F: the device-mapper device does not report 4096-byte sectors"
+fi
+
+# === G. metadata first ===========================================================================================
+# A slow disk: the structures of the volume and the --first path are read before the bulk.
+slowvol="$(dm_create metaslow "$(dm_delay "$loop" 0 $SIZE 15)")"
+D="$W/g1"
+mkdir -p "$D"
+"$TOOL" "$slowvol" --dir "$D" --name metavol --interval 1 --no-temp --first media/sub >"$W/g1.out" 2>&1 &
+pid=$!
+for _ in $(seq 1 240); do
+  grep -Fx media/sub "$D/metavol.logs/first.done" >/dev/null 2>&1 && break
+  sleep 0.5
+done
+kill -TERM "$pid"
+wait "$pid"
+eq "G: the run is interrupted once the --first path has been read" 130 "$?"
+check "G: the phase is recorded as done" test -e "$D/metavol.logs/meta.done"
+read -r mfts mftl <<<"$(istat -r "$VOL" 0 | awk '/Starting address/ { gsub(/,/, ""); print $3 * 4096, $5 * 4096; exit }')"
+check "G: the first run of the \$MFT is in the image" same_bytes "$VOL" "$D/metavol.img" "$mfts" "$mftl"
+mapfile -t sub_runs < <(ntfs_runs "$VOL" media/sub/clip.bin)
+read -r subs subl <<<"${sub_runs[0]}"
+check "G: the data of the --first path is in the image" same_bytes "$VOL" "$D/metavol.img" "$subs" "$subl"
+check "G: the tail of the disk has not been read yet" bash -c "! cmp -s -i $((SIZE - 8 * M)) -n $((4 * M)) '$VOL' '$D/metavol.img'"
+# the ordinary copy has no domain (-m); the reads of the metadata phase do
+first_copy="$(grep -n 'phase copy:' "$D/metavol.logs/rescue.log" | grep -v -- ' -m ' | head -1 | cut -d: -f1)"
+meta_end="$(grep -n 'metadata first: finished' "$D/metavol.logs/rescue.log" | head -1 | cut -d: -f1)"
+check "G: the log has the metadata phase before the first ordinary copy" test -n "$meta_end" -a "$meta_end" -lt "${first_copy:-999999}"
+check "G: ...and names the steps" bash -c "grep -F 'metadata first: the \$MFT' '$D/metavol.logs/rescue.log' >/dev/null"
+fast="$(dm_create metafast "$(dm_linear "$loop" 0 $SIZE)")"
+tool "$fast" --dir "$D" --name metavol --interval 1 --no-temp
+rc_is "G: the next run finishes the disk" 0
+check "G: ...without doing the metadata phase again" bash -c "! grep -F 'metadata first: the start of the disk' '$OUT' >/dev/null"
+check "G: ...and the image equals the volume" cmp -s "$VOL" "$D/metavol.img"
+
+# --no-meta-first
+D="$W/g2"
+mkdir -p "$D"
+tool "$fast" --dir "$D" --name nometa --interval 1 --no-temp --no-meta-first
+rc_is "G: --no-meta-first" 0
+check "G: ...skips the phase" bash -c "! grep -F 'metadata first' '$OUT' >/dev/null"
+check "G: ...and still images the volume" cmp -s "$VOL" "$D/nometa.img"
+
+# a whole-disk image: the offset of the partition is applied in the metadata phase too
+D="$W/g3"
+mkdir -p "$D"
+tool "$diskw" --dir "$D" --name wholemeta --interval 1 --no-temp --first media/sub
+rc_is "G: metadata first on a whole-disk image" 0
+check "G: ...the \$MFT is read" out_has "metadata first: the \$MFT"
+check "G: ...the --first path is read" out_has "metadata first: the data of --first media/sub"
+check "G: ...the image equals the disk" cmp -s "$W/whole1.img" "$D/wholemeta.img"
+
+# a path that does not exist, and a device without NTFS
+tool "$fast" --dir "$W/g2" --name nometa --interval 1 --no-temp --first nothing/here
+rc_is "G: a --first path that is not there" 0
+D="$W/g4"
+mkdir -p "$D"
+tool "$diske" --dir "$D" --name nofsmeta --interval 1 --no-temp --first something
+rc_is "G: --first on a volume without a readable file system" 0
+check "G: ...says there is nothing to read first" out_has "no NTFS volume"
+# an ext4 volume: the file level works, the metadata-first phase is NTFS only
+truncate -s $((32 * M)) "$W/ext4g.img"
+mkfs.ext4 -q -F "$W/ext4g.img" >/dev/null 2>&1
+loopx="$(loop_attach "$W/ext4g.img")"
+diskx="$(dm_create ext4g "$(dm_linear "$loopx" 0 $((32 * M)))")"
+D="$W/g5"
+mkdir -p "$D"
+tool "$diskx" --dir "$D" --name ext4meta --interval 1 --no-temp --first something
+rc_is "G: --first on an ext4 volume" 0
+check "G: ...says that only NTFS is read this way" out_has "only NTFS volumes are read this way"
 
 finish

@@ -40,10 +40,18 @@ zone_min_progress=$((16 * 1024 * 1024)) # an attempt narrowing a zone by less is
 artifact_limit=$((1000 * 1000 * 1000))  # more "dropped disk" traces than this are reverted
 artifact_bad=$((16 * 1024 * 1024))      # a "bad" area larger than this in one piece is a trace, not a bad spot
 temp_cmd=${LASTREAD_TEMP_CMD:-} smart_type="" no_temp=0
-extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
+partition=""
+meta_first=1 firsts=()          # read the structures of the volume (and --first paths) before the rest
+recheck_garbage=0 GARBAGE_RE=""
+verify=0 extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
 extract_to="" includes=() maps=() owner="" file_mode=0664 dir_mode=0775
 suspect_patterns=() suspect_zeros=$((128 * 1024)) suspect_check=1
 DRY_RUN=0
+readonly_flag=1                       # set the kernel read-only flag on the source while rescuing
+event_cmd=${LASTREAD_ON_EVENT:-}      # program run on events (--on-event)
+print_service=0                       # print a systemd unit for the command line and exit
+status=0 json=0                       # --status [--json]
+triage=0 triage_timeout=20            # --triage
 
 # Observed on a real failing 2.5" SMR drive: service sectors with the tag "sEDU" at the start and
 # at the end of a 512-byte sector were returned instead of data, with no read error.
@@ -52,14 +60,20 @@ DEFAULT_SUSPECT_RE='sEDU\x00{504}sEDU'
 # --- State ---------------------------------------------------------------------------------------
 
 SECTOR=512 PART_SIZE=0 CLUSTER=0
+FS_KIND="" FS_OFFSET=0 TSK_O=() FSOUT="" # file system family (ntfs ext fat), where the volume starts in the image (bytes), the TSK -o option, fsstat-style description
 dev="" parent="" whole="" SCSI_HOST="" TRANSPORT="" timeout_file=""
 img="" map="" logs="" zones="" domain="" LOG="" RATES=""
 TMPD="" DD_PID="" INHIBIT_PID="" orig_timeout=""
 TEMP_GUARD=1 SMART_ARGS=()
-TARGET_RANGES=""
+RO_SET=0 RO_ORIG="" # the read-only flag: did we set it, what was it before
+RUN_STARTED=0 RUN_STATE="" CUR_PHASE="" LAST_TEMP="" RESCUED="" RATE=""
+RATE_T=() RATE_B=()
+TRI_NOTES=() TRI_WARN=() TRI_RED=() TRI_RES="" TRI_MS=0 SMART_TYPE_FOUND=""
+ORIG_ARGS=()
+TARGET_RANGES="" PRIORITY_MODE=0 # PRIORITY_MODE: the ranges in TARGET_RANGES are read without the deferred zones
 # Set by image_prepare: ok | skipped (no file level for this image) | missing (no Sleuth Kit)
 FS_STATE=""
-RUN_AS=() SUSPECT_RE=""
+RUN_AS=() SUSPECT_RE="" STREAM_SHA="" MANIFEST=""
 recoveries=0
 ZS="" ZE="" ZD=""
 C_RED="" C_YELLOW="" C_BOLD="" C_RESET=""
@@ -69,9 +83,38 @@ C_RED="" C_YELLOW="" C_BOLD="" C_RESET=""
 log() { printf '%s\n' "$*"; }
 info() { printf '%s %s%s%s\n' "$(date '+%H:%M:%S')" "$C_BOLD" "$*" "$C_RESET"; }
 warn() { printf '%s %swarning:%s %s\n' "$(date '+%H:%M:%S')" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die() {
+die() { die_code 1 "$@"; }
+# die_code CODE MESSAGE: exit codes are 1 error, 3 power cycle needed (see --help).
+die_code() {
+  local code=$1
+  shift
   printf '%s %serror:%s %s\n' "$(date '+%H:%M:%S')" "$C_RED" "$C_RESET" "$*" >&2
-  exit 1
+  if ((RUN_STARTED)); then
+    if [[ $code == 3 ]]; then write_state power-cycle; else
+      write_state failed
+      notify failed "$*"
+    fi
+  fi
+  exit "$code"
+}
+# notify EVENT MESSAGE: runs --on-event PROGRAM in the background (never blocks the rescue, its
+# failure is ignored). No shell is involved: the program gets the event and the message as
+# arguments and LASTREAD_EVENT, LASTREAD_MESSAGE, LASTREAD_NAME, LASTREAD_DIR, LASTREAD_STATUS.
+notify() {
+  [[ -n $event_cmd ]] || return 0
+  local st
+  st="$(status_short 2>/dev/null)" || st=""
+  LASTREAD_EVENT=$1 LASTREAD_MESSAGE=$2 LASTREAD_NAME=$name LASTREAD_DIR=$dir LASTREAD_STATUS=$st \
+    timeout 60 "$event_cmd" "$1" "$2" </dev/null >>"${LOG:-/dev/null}" 2>&1 8>&- &
+}
+# write_state STATE: the small state file that --status reads (atomically replaced).
+write_state() {
+  RUN_STATE=$1
+  [[ -n $logs && -d $logs ]] || return 0
+  if printf 'updated=%s\npid=%s\nstate=%s\nphase=%s\ntemperature=%s\nrescued=%s\nrate=%s\nmeta=%s\n' \
+    "$(date +%s)" "$$" "$1" "$CUR_PHASE" "$LAST_TEMP" "$RESCUED" "$RATE" "$((meta_first && !no_fs))" >"$logs/state.new" 2>/dev/null; then
+    mv -f "$logs/state.new" "$logs/state" 2>/dev/null || true
+  fi
 }
 # Message to the screen and to the run log (once the log directory exists).
 note() {
@@ -141,11 +184,16 @@ Dropped disk:
                        more than this much "dropped disk" traces in the map are reverted [1G]
   --artifact-bad SIZE  a bad area larger than this in one piece counts as a trace [16Mi]
 
-File level (NTFS only; needs The Sleuth Kit; the image is never mounted):
+File level (NTFS, ext2/3/4, FAT and exFAT; needs The Sleuth Kit; the image is never mounted):
   --extract            extract the intact files from the image (needs --extract-to)
   --extract-damaged    in a normal run, extract the damaged files too (their unreadable parts are
                        zeros); a later run skips such a file because size and time match, so
                        delete it before recovering it again
+  --verify             check every extracted file: it is synced, dropped from the cache, read back and
+                       compared by SHA-256 with what the image gave; hashes go to NAME.logs/manifest.sha256
+                       (sha256sum -c format, paths relative to --extract-to). Files already in place are
+                       checked too, against the manifest or else against the image: a copy whose write
+                       was cut short is found and extracted again
   --extract-to DIR     where to extract; the tree of the volume is preserved
   --include PREFIX     extract only this path (a directory or a file) of the volume; repeatable
   --map SRC:DST        extract the volume path SRC (a directory or a file) into the directory DST
@@ -161,14 +209,49 @@ File level (NTFS only; needs The Sleuth Kit; the image is never mounted):
   --pick               targeted recovery: choose incomplete files in a window and read only them
   --file PART          targeted recovery without questions: incomplete files whose path contains
                        PART; repeatable
+  --partition N        a whole-disk image holds several volumes the file level can read: use the
+                       N-th partition of its table (the order of /dev/sdX1, /dev/sdX2, …; see mmls).
+                       Without it the only such partition is used
+  --first PATH         read the data of this path of the volume (a directory or a file) right after
+                       the structures of the volume, before the rest of the disk; repeatable
+  --no-meta-first      do not read the structures of an NTFS volume (\$MFT, directory indexes) and the
+                       --first paths before everything else (this is the default for NTFS)
   --no-fs              imaging only: no file level at all
 
 Silent garbage (the disk answered without an error, but with something else than data):
+  --recheck-garbage    after copy, scrape and retry, scan the image once for the --suspect-pattern
+                       (by default the sEDU service sector; the zero-run check is not used here),
+                       mark those sectors as unreadable so that retry reads them again, and count
+                       what is still garbage afterwards as unreadable (such files are damaged)
   --suspect-pattern RE a grep -P pattern (bytes, LC_ALL=C); files whose data matches are listed
                        as suspicious. Repeatable; replaces the built-in pattern
                        'sEDU\\x00{504}sEDU' (a service sector seen on a failing SMR drive)
   --suspect-zeros SIZE a run of zeros this long counts as garbage; 0 turns the check off [128Ki]
   --no-suspect-check   do not check the data at all
+
+Safety and notifications:
+  --no-readonly        do not set the kernel's read-only flag on the source while rescuing (it is
+                       set by default, restored on exit and set again on a disk that comes back)
+  --on-event PROGRAM   run PROGRAM on events, in the background and without a shell:
+                       PROGRAM EVENT MESSAGE, plus LASTREAD_EVENT, LASTREAD_MESSAGE, LASTREAD_NAME,
+                       LASTREAD_DIR, LASTREAD_STATUS in the environment (default from
+                       \$LASTREAD_ON_EVENT). Events: started, hot, cooled, dropped, recovered,
+                       power-cycle, zones-stuck, phase-done, done, interrupted, failed.
+  --print-service      print a systemd unit that runs this command line (enable it and the rescue
+                       continues by itself after a power cycle) and exit
+
+Before a rescue:
+  --triage             a short check of SOURCE that only reads: identity, SMART (if available),
+                       kernel messages about the disk and about 9 one-megabyte sample reads, then
+                       a verdict (green / yellow / red) and suggested options. Exit status 4 for
+                       red. Needs root; no --dir needed. Stops sampling after two failures.
+  --triage-timeout SEC wait this long for each sample read [20]
+
+Looking at a rescue:
+  --status             progress of a rescue from its map and logs, without touching the disk or
+                       needing root: state, phase, rescued share, rate, rough time left, zones,
+                       temperature, last events (find the image with --dir/--name like --inventory)
+  --json               with --status: the same as JSON (needs jq), for monitoring
 
 General:
   --dry-run            show the state and what would be done, run nothing
@@ -176,7 +259,7 @@ General:
   --version            print the version
 
 Exit status: 0 done, 1 error, 2 only stuck deferred zones are left (see --give-up-zones),
-130 interrupted (the next run continues).
+3 the disk does not answer and needs a power cycle, 130 interrupted (the next run continues).
 EOF
 }
 
@@ -212,7 +295,7 @@ parse_args() {
         --retries | --start-at | --add-zone | --rescan-pause | --rescan-attempts | \
         --kernel-timeout | --zone-margin | --zone-min-progress | --artifact-limit | --artifact-bad | \
         --extract-to | --include | --map | --owner | --file-mode | --dir-mode | --file | \
-        --suspect-pattern | --suspect-zeros)
+        --suspect-pattern | --suspect-zeros | --on-event | --triage-timeout | --partition | --first)
         [[ -n ${2:-} ]] || die "$1: a value is required (see --help)"
         case $1 in
           --dir) dir=$2 ;;
@@ -243,11 +326,17 @@ parse_args() {
           --file) file_patterns+=("$2") ;;
           --suspect-pattern) suspect_patterns+=("$2") ;;
           --suspect-zeros) suspect_zeros=$2 ;;
+          --on-event) event_cmd=$2 ;;
+          --triage-timeout) triage_timeout=$2 ;;
+          --partition) partition=$2 ;;
+          --first) firsts+=("$2") ;;
         esac
         shift
         ;;
       --extract) extract=1 ;;
       --extract-damaged) extract_damaged=1 ;;
+      --verify) verify=1 ;;
+      --recheck-garbage) recheck_garbage=1 ;;
       --reverse) reverse=1 ;;
       --give-up-zones) give_up=1 ;;
       --inventory) inventory=1 ;;
@@ -255,7 +344,13 @@ parse_args() {
       --no-rescan) rescan=0 ;;
       --no-temp) no_temp=1 ;;
       --no-fs) no_fs=1 ;;
+      --no-meta-first) meta_first=0 ;;
       --no-suspect-check) suspect_check=0 ;;
+      --no-readonly) readonly_flag=0 ;;
+      --print-service) print_service=1 ;;
+      --status) status=1 ;;
+      --triage) triage=1 ;;
+      --json) json=1 ;;
       --dry-run) DRY_RUN=1 ;;
       -h | --help)
         usage
@@ -285,6 +380,21 @@ validate_args() {
   need_number --rescan-pause "$rescan_pause"
   need_number --rescan-attempts "$rescan_attempts"
   need_number --kernel-timeout "$kernel_timeout"
+  need_number --triage-timeout "$triage_timeout"
+  [[ -z $partition ]] || { [[ $partition =~ ^[1-9][0-9]*$ ]] || die "--partition: a number from 1, not \"$partition\""; }
+  if ((${#firsts[@]})); then
+    ((meta_first)) || die "--first needs the metadata-first phase: it cannot be combined with --no-meta-first"
+    ((!no_fs)) || die "--first needs the file level: it cannot be combined with --no-fs"
+    ((!inventory && !status && !triage)) || die "--first only goes with a rescue"
+    local i f
+    for i in "${!firsts[@]}"; do
+      f="${firsts[i]#/}"
+      firsts[i]="${f%/}"
+      [[ -n ${firsts[i]} ]] || die "--first: an empty path"
+    done
+  fi
+  triage_timeout=$((10#$triage_timeout))
+  ((triage_timeout > 0)) || die "--triage-timeout must be at least 1"
   # decimal even with a leading zero (08 is not an octal number here)
   stop=$((10#$stop)) resume=$((10#$resume)) interval=$((10#$interval)) retries=$((10#$retries))
   rescan_pause=$((10#$rescan_pause)) rescan_attempts=$((10#$rescan_attempts)) kernel_timeout=$((10#$kernel_timeout))
@@ -305,6 +415,10 @@ validate_args() {
     die "--no-fs cannot be combined with --extract, --inventory, --pick or --file"
   ((!inventory)) || ! ((pick || ${#file_patterns[@]})) ||
     die "--inventory cannot be combined with --pick or --file"
+  ((!json)) || ((status)) || die "--json only goes with --status"
+  ((status + inventory + print_service + triage <= 1)) || die "--status, --inventory, --triage and --print-service exclude each other"
+  ((!triage)) || ((!extract && !pick && ${#file_patterns[@]} == 0)) || die "--triage only looks: it cannot be combined with --extract, --pick or --file"
+  ((!status)) || ((!extract && !pick && ${#file_patterns[@]} == 0)) || die "--status only looks: it cannot be combined with --extract, --pick or --file"
   ((!extract_damaged)) || ((extract)) || die "--extract-damaged needs --extract"
   ((!extract_damaged)) || ! ((inventory || pick || ${#file_patterns[@]})) ||
     die "--extract-damaged only applies to a normal run, not to --inventory, --pick or --file"
@@ -313,6 +427,7 @@ validate_args() {
   elif [[ -n $extract_to || -n $owner ]]; then
     die "--extract-to and --owner only make sense with --extract"
   fi
+  ((!verify)) || ((extract)) || die "--verify only makes sense with --extract"
   ((${#includes[@]} + ${#maps[@]} == 0)) || ((extract || inventory)) ||
     die "--include and --map only make sense with --extract or --inventory"
   local i
@@ -363,6 +478,21 @@ validate_args() {
   fi
   SUSPECT_RE=""
   for n in "${parts[@]}"; do SUSPECT_RE+="${SUSPECT_RE:+|}$n"; done
+  if ((recheck_garbage)); then
+    ((suspect_check)) || die "--recheck-garbage needs the data check: it cannot be combined with --no-suspect-check"
+    # grep -b prints the offset of the first byte of a match; a lookahead keeps the printed match to one
+    # byte, whatever the pattern (a match with NUL bytes or newlines would break the parsing).
+    if ((${#suspect_patterns[@]})); then
+      local alt=""
+      for n in "${suspect_patterns[@]}"; do alt+="${alt:+|}(?:$n)"; done
+      GARBAGE_RE="(?=$alt)[\\s\\S]"
+    else
+      GARBAGE_RE='sEDU(?=\x00{504}sEDU)'
+    fi
+    n=0
+    grep -aP -- "$GARBAGE_RE" </dev/null >/dev/null 2>&1 || n=$?
+    ((n != 2)) || die "the garbage pattern is not a valid grep -P pattern (--suspect-pattern): $GARBAGE_RE"
+  fi
   if [[ -n $SUSPECT_RE ]]; then
     # grep exits with 2 on an invalid pattern (1 is "no match"): better to learn it now than at the
     # first extracted file, days into a rescue.
@@ -509,7 +639,9 @@ die_device() {
   else
     why=" and rescanning did not bring it back"
   fi
-  die "the disk does not answer ($dev)$why. Power the machine fully off, switch it on and run the same command again: it continues where it stopped"
+  local msg="the disk does not answer ($dev)$why. Power the machine fully off, switch it on and run the same command again: it continues where it stopped"
+  notify power-cycle "$msg"
+  die_code 3 "$msg"
 }
 # Brings a dropped disk back without a power cycle: pause, rescan of the SCSI host, wait for the
 # device, then the usual direct read. At most rescan_attempts times in a row without progress.
@@ -530,14 +662,27 @@ recover_device() {
   sleep "$rescan_pause"
   rescan_host "$SCSI_HOST" || return 1
   resolve_device
-  ((kernel_timeout == 0)) || [[ ! -w $timeout_file ]] || echo "$kernel_timeout" >"$timeout_file"
+  raise_kernel_timeout
   device_ok || return 1
+  set_readonly
   note "the disk is back: $dev"
+  notify recovered "the disk is back: $dev"
+}
+# Raises the kernel's command timeout of the (new) device to --kernel-timeout; never lowers it.
+raise_kernel_timeout() {
+  local cur
+  ((kernel_timeout > 0)) || return 0
+  [[ -w $timeout_file ]] || return 0
+  cur="$(cat "$timeout_file")"
+  if [[ $cur =~ ^[0-9]+$ ]] && ((cur < kernel_timeout)); then echo "$kernel_timeout" >"$timeout_file"; fi
 }
 wait_cool() {
   local t last=-1000
   while :; do
     t="$(temperature)" || t=""
+    LAST_TEMP=$t
+    RATE=0 RATE_T=() RATE_B=()
+    write_state cooling
     if [[ -z $t ]]; then
       warn "temperature unavailable — pausing for 5 minutes"
       sleep 300
@@ -545,6 +690,7 @@ wait_cool() {
     fi
     if ((t <= resume)); then
       note "temperature $t °C — continuing"
+      notify cooled "temperature $t °C — continuing"
       return 0
     fi
     if ((SECONDS - last >= 300)); then
@@ -704,12 +850,16 @@ has() {
   ! ddrescuelog "${dom[@]}" -t "$map" | grep -E "^ *$1: +0 B," >/dev/null
 }
 next_phase() {
-  if [[ ! -f $map ]] || has non-tried; then
+  if meta_pending; then
+    echo meta
+  elif [[ ! -f $map ]] || has non-tried; then
     echo copy
   elif has non-trimmed || has non-scraped; then
     echo scrape
   elif has bad-sector && [[ ! -e $logs/retry.done ]]; then
     echo retry
+  elif ((recheck_garbage)) && [[ ! -e $logs/garbage.done ]]; then
+    echo garbage
   elif zones_exist && ! zones_abandoned; then
     if [[ -n "$(zone_next)" ]]; then echo zones; else echo zones-stuck; fi
   elif [[ ! -e $logs/report.done ]]; then
@@ -725,6 +875,9 @@ next_phase() {
 # 11 — the disk dropped; otherwise the exit code of ddrescue.
 run_ddrescue() {
   local phase=$1 t last=$SECONDS paused=0 rc=0
+  CUR_PHASE=$phase
+  RATE_T=() RATE_B=()
+  write_state running
   RATES="$logs/rates-$(date '+%Y%m%d-%H%M%S')-$phase.log"
   local -a args=(-d -b "$SECTOR" -T 10m --log-events="$logs/events.log" --log-rates="$RATES")
   case $phase in
@@ -785,11 +938,15 @@ run_ddrescue() {
       return 11
     fi
     t="$(temperature)" || t=""
+    LAST_TEMP=$t
+    sample_progress
+    write_state running
     if [[ -n $t ]] && ((t >= stop)); then
       note "temperature $t °C ≥ $stop °C — stopping ddrescue, the map is saved"
       # TERM, not INT: background processes of a script without job control ignore SIGINT.
       kill -TERM "$DD_PID"
       paused=1
+      notify hot "temperature $t °C ≥ $stop °C: ddrescue stopped until $resume °C"
       break
     fi
     if ((SECONDS - last >= 300)); then
@@ -841,37 +998,153 @@ map_size() {
 # table, unreadable boot sector); missing — The Sleuth Kit is not installed (fixable, so the callers
 # must not record the file level as done).
 image_prepare() {
-  local fstype fsout
   FS_STATE=skipped
   ((!no_fs)) || return 0
   if ! tsk_available; then
     FS_STATE=missing
-    warn "The Sleuth Kit (fls, istat, icat, fsstat, ils) is missing: no file level (apt install sleuthkit)"
+    warn "The Sleuth Kit (fls, istat, icat, fsstat, ils, mmls) is missing: no file level (apt install sleuthkit)"
     return 0
   fi
   if (($(stat -c %s "$img") < PART_SIZE)); then truncate -s "$PART_SIZE" "$img" || die "cannot extend $img to the size of the device"; fi
-  fsout="$(fsstat "$img" 2>/dev/null)" || fsout=""
-  fstype="$(awk -F': *' '/^File System Type:/ {print $2; exit}' <<<"$fsout")"
-  if [[ $fstype != NTFS ]]; then
-    if [[ -n $fstype ]]; then
-      note "the file system is $fstype: the file level supports NTFS only; the image itself is fine"
-    elif blkid -p -o value -s PTTYPE "$img" 2>/dev/null | grep . >/dev/null; then
-      note "the image has a partition table: the file level needs a partition image (image the partition, for example /dev/sdX1)"
-    else
-      note "the image is not recognised as NTFS (fsstat): no file level; the image itself is fine"
-    fi
-    return 0
-  fi
-  CLUSTER="$(awk -F': *' '/^Cluster Size/ {print $2; exit}' <<<"$fsout")"
+  if ! fs_locate; then return 0; fi
+  # CLUSTER is the unit of the pieces file_map reports: the cluster of NTFS, the block of ext, the
+  # sector of FAT/exFAT (istat -r lists their runs in sectors)
+  case $FS_KIND in
+    ntfs) CLUSTER="$(awk -F': *' '/^Cluster Size/ {print $2; exit}' <<<"$FSOUT")" ;;
+    ext) CLUSTER="$(awk -F': *' '/^Block Size:/ {print $2; exit}' <<<"$FSOUT")" ;;
+    fat) CLUSTER="$(awk -F': *' '/^Sector Size:/ {print $2; exit}' <<<"$FSOUT")" ;;
+  esac
   if [[ ! $CLUSTER =~ ^[0-9]+$ ]]; then
-    note "cluster size of the volume is unknown (fsstat): no file level"
+    note "the block size of the volume is unknown (fsstat): no file level"
     return 0
   fi
   FS_STATE=ok
 }
+# The family of a file system type (as fsstat names it) that the file level can read:
+# ntfs, ext (ext2/3/4), fat (FAT12/16/32 and exFAT); empty for the rest.
+fs_kind_of() {
+  case "${1,,}" in
+    ntfs) echo ntfs ;;
+    ext2 | ext3 | ext4) echo ext ;;
+    fat12 | fat16 | fat32 | exfat) echo fat ;;
+  esac
+}
+# The file system type in fsstat output.
+fs_type() { awk -F': *' '/^File System Type:/ {print $2; exit}' <<<"$1"; }
+# Where the volume starts in the image: TSK takes the offset in 512-byte sectors.
+tsk_set_offset() {
+  FS_OFFSET=$1
+  TSK_O=()
+  ((FS_OFFSET == 0)) || TSK_O=(-o "$((FS_OFFSET / 512))")
+}
+# FAT and exFAT are recognised from the boot sector: fsstat of The Sleuth Kit 4.12 does not return
+# on exFAT and is slow on large FAT volumes. boot_probe OFFSET prints "TYPE BYTES_PER_SECTOR" for a
+# FAT12/16/32 or exFAT boot sector at that byte offset of the image; fails for anything else.
+boot_probe() {
+  local o=$1 bps oem t
+  oem="$(dd if="$img" bs=1 skip=$((o + 3)) count=8 status=none 2>/dev/null)" || return 1
+  if [[ $oem == "EXFAT   " ]]; then
+    bps=$((1 << $(img_le $((o + 108)) 1)))
+    ((bps >= 512 && bps <= 4096)) || return 1
+    echo "exFAT $bps"
+    return 0
+  fi
+  bps="$(img_le $((o + 11)) 2)"
+  ((bps == 512 || bps == 1024 || bps == 2048 || bps == 4096)) || return 1
+  t="$(dd if="$img" bs=1 skip=$((o + 82)) count=8 status=none 2>/dev/null)" || return 1
+  if [[ $t == "FAT32   " ]]; then
+    echo "FAT32 $bps"
+    return 0
+  fi
+  t="$(dd if="$img" bs=1 skip=$((o + 54)) count=8 status=none 2>/dev/null)" || return 1
+  case $t in
+    "FAT12   " | "FAT16   ")
+      echo "${t%% *} $bps"
+      return 0
+      ;;
+  esac
+  return 1
+}
+tsk_fsstat() { timeout 120 fsstat "$@"; }
+# The fsstat-style description of the file system at byte OFFSET of the image (synthesised for
+# FAT/exFAT); fails if there is none.
+fs_probe() {
+  local o=$1 bp t bps out
+  if bp="$(boot_probe "$o")"; then
+    read -r t bps <<<"$bp"
+    printf 'File System Type: %s\nSector Size: %s\n' "$t" "$bps"
+    return 0
+  fi
+  out="$(tsk_fsstat -o $((o / 512)) "$img" 2>/dev/null)" || return 1
+  printf '%s\n' "$out"
+}
+# Finds the NTFS volume in the image: the image itself (a partition image), or a partition of a
+# whole-disk image (mmls). Sets FS_OFFSET/TSK_O and FSOUT (fsstat output); returns 1, after saying
+# why, if there is no usable volume.
+fs_locate() {
+  local fstype mm unit s t i n=0 label
+  local -a starts=() types=() usable=()
+  tsk_set_offset 0
+  FSOUT="$(fs_probe 0)" || FSOUT=""
+  fstype="$(fs_type "$FSOUT")"
+  FS_KIND="$(fs_kind_of "$fstype")"
+  if [[ -n $FS_KIND ]]; then return 0; fi
+  if [[ -n $fstype ]]; then
+    note "the file system is $fstype: the file level supports NTFS, ext2/3/4 and FAT/exFAT only; the image itself is fine"
+    return 1
+  fi
+  if mm="$(mmls -b "$SECTOR" "$img" 2>/dev/null)" && [[ -n $mm ]]; then
+    unit="$(sed -n 's/^Units are in \([0-9]*\)-byte sectors.*/\1/p' <<<"$mm")"
+    unit=${unit:-512}
+    while read -r s; do
+      starts+=($((10#$s * unit)))
+    done < <(awk '/^[0-9]+:/ && $2 != "Meta" && $2 != "-------" {print $3}' <<<"$mm")
+    for i in "${!starts[@]}"; do
+      t="$(fs_type "$(fs_probe "${starts[i]}")")"
+      types+=("${t:-unknown}")
+      [[ -z "$(fs_kind_of "$t")" ]] || usable+=("$i")
+    done
+    if ((${#starts[@]} == 0)); then
+      note "the partition table of the image lists no partitions: no file level"
+      return 1
+    fi
+    if [[ -n $partition ]]; then
+      i=$((partition - 1))
+      if ((i >= ${#starts[@]})); then
+        note "--partition $partition: the image has only ${#starts[@]} partitions"
+        return 1
+      fi
+      if [[ -z "$(fs_kind_of "${types[i]}")" ]]; then
+        note "--partition $partition is ${types[i]}: the file level supports NTFS, ext2/3/4 and FAT/exFAT only"
+        return 1
+      fi
+    elif ((${#usable[@]} == 1)); then
+      i=${usable[0]}
+    elif ((${#usable[@]} == 0)); then
+      note "no partition with a supported file system in the image (partitions: ${types[*]}): no file level"
+      return 1
+    else
+      label=""
+      for n in "${usable[@]}"; do label+=" $((n + 1))"; done
+      note "several partitions with a supported file system in the image (partitions$label): choose one with --partition N"
+      return 1
+    fi
+    tsk_set_offset "${starts[i]}"
+    FSOUT="$(fs_probe "${starts[i]}")" || FSOUT=""
+    FS_KIND="$(fs_kind_of "$(fs_type "$FSOUT")")"
+    note "the file level works on partition $((i + 1)) of the image ($(fs_type "$FSOUT"), offset ${starts[i]} bytes)"
+    return 0
+  fi
+  if blkid -p -o value -s PTTYPE "$img" 2>/dev/null | grep . >/dev/null; then
+    note "the image has a partition table that mmls cannot read: no file level"
+  else
+    note "the image holds no file system the file level can read (NTFS, ext2/3/4, FAT/exFAT): no file level; the image itself is fine"
+  fi
+  return 1
+}
 tsk_available() {
   local c
-  for c in fls istat icat fsstat ils; do command -v "$c" >/dev/null || return 1; done
+  for c in fls istat icat fsstat ils mmls; do command -v "$c" >/dev/null || return 1; done
 }
 # Regular files of the volume: "ID<TAB>PATH" (ID — the MFT entry with a data attribute, for icat).
 # System files ($…) and named streams (a path with ":") are skipped. A directory entry that points
@@ -883,30 +1156,46 @@ tsk_available() {
 # entries. A fragmented file is listed by fls twice (once per attribute, see file_map) — one line
 # per entry and path remains. A name with a tab cannot be put in the list: it becomes "?/entry N".
 tsk_files() {
-  local listed="$TMPD/fls.txt" alloc="$TMPD/ils-alloc.txt" i out name id path check
-  fls -r -p -u "$img" >"$listed" 2>/dev/null || true
+  local listed="$TMPD/fls.txt" alloc="$TMPD/ils-alloc.txt" i out name id path check first=24 is_ntfs=1
+  fls -r -p -u "${TSK_O[@]}" "$img" >"$listed" 2>/dev/null || true
+  # The first user entry: NTFS keeps 24 system entries, ext 11 (lost+found). FAT/exFAT have no entry
+  # table that ils could list, so unlisted entries are not looked for there.
+  case $FS_KIND in
+    ext)
+      first=11
+      is_ntfs=0
+      ;;
+    fat)
+      first=999999999999
+      is_ntfs=0
+      ;;
+  esac
   # ils only saves work: entries it does not list as allocated are verified with istat below.
-  ils -a "$img" 2>/dev/null | awk -F'|' 'NR > 3 && $2 == "a" && $1 >= 24 {print $1}' | sort -u >"$alloc" || true
-  if [[ ! -s $alloc && -s $listed ]]; then
+  ils -a "${TSK_O[@]}" "$img" 2>/dev/null | awk -F'|' -v first="$first" 'NR > 3 && $2 == "a" && $1 >= first {print $1}' | sort -u >"$alloc" || true
+  if ((is_ntfs)) && [[ ! -s $alloc && -s $listed ]]; then
     warn "ils listed no allocated entries: every entry is checked with istat, and unlisted entries cannot be found"
   fi
   while IFS=$'\t' read -r id path check; do
     if [[ $check == 1 ]]; then
-      out="$(istat "$img" "${id%%-*}" 2>/dev/null)" || out=""
+      out="$(istat "${TSK_O[@]}" "$img" "${id%%-*}" 2>/dev/null)" || out=""
       ! grep '^Not Allocated File' <<<"$out" >/dev/null || continue
     fi
     printf '%s\t%s\n' "$id" "$path"
-  done < <(ALLOC="$alloc" awk -F'\t' '
-    BEGIN { while ((getline l < ENVIRON["ALLOC"]) > 0) a[l] = 1 }
+  done < <(ALLOC="$alloc" NTFS="$is_ntfs" awk -F'\t' '
+    BEGIN { while ((getline l < ENVIRON["ALLOC"]) > 0) a[l] = 1; ntfs = ENVIRON["NTFS"] + 0 }
     $1 ~ /^r\/r / { split($1, f, " "); id = f[2]; sub(/:$/, "", id)
       rec = id; sub(/-.*/, "", rec)
-      if ($2 ~ /^\$/ || $2 ~ /:/) next
-      if (NF > 2) { if (!seen[rec "\t?"]++) print id "\t?/entry " rec "\t" (rec in a ? 0 : 1); next }
+      if (ntfs && ($2 ~ /^\$/ || $2 ~ /:/)) next
+      if (!ntfs && $2 ~ /^\$(VOLUME_GUID|ALLOC_BITMAP|UPCASE_TABLE|MBR|FAT[12]|OrphanFiles)$/) next
+      chk = (ntfs && !(rec in a)) ? 1 : 0
+      if (NF > 2) { if (!seen[rec "\t?"]++) print id "\t?/entry " rec "\t" chk; next }
       if (seen[rec "\t" $2]++) next
-      print id "\t" $2 "\t" (rec in a ? 0 : 1) }' "$listed")
+      print id "\t" $2 "\t" chk }' "$listed")
   while read -r i; do
-    out="$(istat "$img" "$i" 2>/dev/null)" || continue
-    grep '^Allocated File' <<<"$out" >/dev/null || continue
+    out="$(istat "${TSK_O[@]}" "$img" "$i" 2>/dev/null)" || continue
+    grep '^Allocated' <<<"$out" >/dev/null || continue
+    # ext: only regular files with links (the mode string starts with the type, r for a file)
+    if [[ $FS_KIND == ext ]] && ! grep -E '^mode: r' <<<"$out" >/dev/null; then continue; fi
     name="$(awk -F': ' '/^Name:/ {print $2; exit}' <<<"$out")"
     printf '%s\t?/%s\n' "$i" "${name:-entry $i}"
   done < <(comm -23 "$alloc" \
@@ -926,13 +1215,13 @@ tsk_files() {
 # is missing (most of a multi-gigabyte file); size and initialised size can be wrong too. So the TSK stitching is not
 # used: every piece is taken from its own entry (istat of that entry) and only within the range of
 # that entry according to the attribute list; sizes come from the entry where VCN 0 starts.
-file_map() {
+file_map_ntfs() {
   local rec=$1 base ext e
-  base="$(istat -r -z UTC "$img" "$rec" 2>/dev/null)" || return 1
+  base="$(istat -r -z UTC "${TSK_O[@]}" "$img" "$rec" 2>/dev/null)" || return 1
   ext="$(awk -v r="$rec" '/^Type: 128-[0-9]+[ \t]+MFT Entry: / && $5 != r {print $5}' <<<"$base" | sort -un)"
   {
     printf '%s\n' "$base"
-    for e in $ext; do istat -r "$img" "$e" 2>/dev/null || true; done
+    for e in $ext; do istat -r "${TSK_O[@]}" "$img" "$e" 2>/dev/null || true; done
   } | awk -v multi="${ext:+1}" '
     /^MFT Entry Header Values:/ { n++; next }
     /^Entry:/ { r = $2; next }
@@ -963,7 +1252,13 @@ file_map() {
       vcn += $5 }
     END { kind = resident ? "resident" : multi ? (packed ? "broken" : "split") : (packed ? "packed" : "simple")
       print "M", (size == "" ? "-" : size), (init == "" ? 0 : init), kind, mt }' |
-    sort -n | uniq | awk -v cs="$CLUSTER" '
+    file_map_normalize
+}
+# The last stage of file_map: sorts the pieces ("VCN LCN LENGTH" lines after the "M SIZE INIT KIND MTIME"
+# line), merges neighbours, and makes the file "broken" if they leave a hole or do not reach the size.
+file_map_normalize() {
+  sort -n | uniq | awk -v cs="$CLUSTER" '
+
       BEGIN { pos = 0 }
       $1 == "M" { size = $2; init = $3; kind = $4; mt = $0; sub(/^M [^ ]* [^ ]* [^ ]* ?/, "", mt); next }
       { if ($1 != pos) bad = 1
@@ -974,6 +1269,27 @@ file_map() {
         if (kind != "resident" && (bad || pos * cs < size)) kind = "broken"
         print size, init, kind, mt
         for (i = 1; i <= k; i++) print rv[i], rl[i], rn[i] }'
+}
+# ext and FAT/exFAT: `istat -r` lists the runs of the data as "Starting address: N, length: M" in
+# blocks (sectors for FAT), with "Filler" for a hole before the first run and "Sparse" for holes
+# between and after; both are zeros. A file whose data lies inside the inode (ext inline data) is
+# resident. Same output as file_map_ntfs.
+file_map_blocks() {
+  istat -r -z UTC "${TSK_O[@]}" "$img" "$1" 2>/dev/null | awk '
+    BEGIN { vcn = 0 }
+    /^[Ss]ize: / && size == "" { size = $2 }
+    /^File Modified:/ && mt == "" { sub(/^File Modified:[ \t]*/, ""); sub(/ \(UTC\)$/, ""); mt = $0 }
+    /^Written:/ && mt == "" { sub(/^Written:[ \t]*/, ""); sub(/ \(UTC\)$/, ""); mt = $0 }
+    /^Flags:.*Inline Data/ { inline = 1 }
+    /Starting address:/ { gsub(/,/, ""); print vcn, ($6 == "Filler" || $6 == "Sparse" ? "-" : $3), $5; vcn += $5 }
+    END { print "M", (size == "" ? "-" : size), (size == "" ? 0 : size), (inline ? "resident" : "simple"), mt }' |
+    file_map_normalize
+}
+file_map() {
+  case $FS_KIND in
+    ext | fat) file_map_blocks "$1" ;;
+    *) file_map_ntfs "$1" ;;
+  esac
 }
 # Ranges "START END" from files, ascending; overlapping and adjacent ones merged.
 merge_ranges() {
@@ -993,15 +1309,15 @@ classify() {
       printf 'unknown\t%s\t\t\t%s\t\n' "$id" "$path"
       continue
     fi
-    CS="$CLUSTER" RANGES="$ranges" FID="$id" FPATH="$path" awk '
+    CS="$CLUSTER" OFF="$FS_OFFSET" RANGES="$ranges" FID="$id" FPATH="$path" awk '
       # The first range that ends after B (ranges ascend and do not overlap).
       function after(b, lo, hi, mid) { lo = 1; hi = n + 1
         while (lo < hi) { mid = int((lo + hi) / 2); if (re[mid] > b) hi = mid; else lo = mid + 1 }
         return lo }
-      BEGIN { cs = ENVIRON["CS"] + 0; path = ENVIRON["FPATH"]; id = ENVIRON["FID"]
+      BEGIN { cs = ENVIRON["CS"] + 0; off = ENVIRON["OFF"] + 0; path = ENVIRON["FPATH"]; id = ENVIRON["FID"]
         while ((getline line < ENVIRON["RANGES"]) > 0) { split(line, r, " "); n++; rs[n] = r[1] + 0; re[n] = r[2] + 0 } }
       NR == 1 { size = $1; kind = $3; mt = $0; sub(/^[^ ]* [^ ]* [^ ]* ?/, "", mt); next }
-      $2 != "-" { b0 = $2 * cs; b1 = ($2 + $3) * cs
+      $2 != "-" { b0 = off + $2 * cs; b1 = off + ($2 + $3) * cs
         for (i = after(b0); i <= n && rs[i] < b1; i++) {
           lo = (b0 > rs[i] ? b0 : rs[i]); hi = (b1 < re[i] ? b1 : re[i]); miss += hi - lo } }
       END { st = kind == "broken" ? "unknown" : (miss > 0 ? "damaged" : "intact"); if (path ~ /^\?\//) st = "unknown"
@@ -1015,7 +1331,7 @@ file_stream() {
   local fmap=$1 id=$2 size init kind s n
   read -r size init kind _ <<<"$fmap"
   if [[ $kind != simple && $kind != split ]]; then
-    icat "$img" "$id"
+    icat "${TSK_O[@]}" "$img" "$id"
     return
   fi
   ((init <= size)) || init=$size
@@ -1025,9 +1341,9 @@ file_stream() {
     else
       dd if="$img" bs=1M iflag=skip_bytes,count_bytes skip="$s" count="$n" status=none
     fi
-  done < <(sed 1d <<<"$fmap" | awk -v cs="$CLUSTER" -v init="$init" '
+  done < <(sed 1d <<<"$fmap" | awk -v cs="$CLUSTER" -v off="$FS_OFFSET" -v init="$init" '
     { n = $3 * cs; if (got + n > init) n = init - got; if (n <= 0) exit
-      if ($2 == "-") printf "- %.0f\n", n; else printf "%.0f %.0f\n", $2 * cs, n
+      if ($2 == "-") printf "- %.0f\n", n; else printf "%.0f %.0f\n", off + $2 * cs, n
       got += n }')
   head -c "$((size - init))" /dev/zero
 }
@@ -1095,8 +1411,59 @@ make_dirs() {
 # the list of suspicious files — better downloaded again. Size and mtime alone do not catch
 # corruption if the writes were cut short (for example a USB bridge without FUA): after an abrupt
 # disconnect of the target, check the last files written (see README).
+check_suspect() {
+  if [[ -n $SUSPECT_RE ]]; then grep -c -aP "$SUSPECT_RE"; else cat >/dev/null; fi
+}
+# write_stream FMAP ID DST: the file to DST.part as the owner; prints the number of suspicious
+# "lines" of the data. With --verify the SHA-256 of the stream goes to $STREAM_SHA.
+write_stream() {
+  if ((verify)); then
+    rm -f "$STREAM_SHA"
+    file_stream "$1" "$2" | tee >(sha256sum | cut -d' ' -f1 >"$STREAM_SHA") | "${RUN_AS[@]}" tee "$3.part" | check_suspect
+  else
+    file_stream "$1" "$2" | "${RUN_AS[@]}" tee "$3.part" | check_suspect
+  fi
+}
+# The hash of the stream written by write_stream (the hashing process finishes a moment after the pipe).
+stream_hash() {
+  local i
+  for i in $(seq 1 300); do
+    [[ -s $STREAM_SHA ]] && break
+    sleep 0.1
+  done
+  cat "$STREAM_SHA" 2>/dev/null || true
+}
+# verify_file FILE HASH: what is on the target, not in its cache: sync, drop the cached pages, read the
+# file back and compare. Succeeds if the SHA-256 is HASH.
+verify_file() {
+  local got
+  sync -- "$1" 2>/dev/null || sync
+  dd if="$1" iflag=nocache count=0 status=none 2>/dev/null || true
+  got="$(sha256sum -- "$1" | cut -d' ' -f1)"
+  [[ $got == "$2" ]]
+}
+# The last hash recorded in the manifest for a path relative to --extract-to.
+manifest_hash() {
+  [[ -f $MANIFEST ]] || return 0
+  RELP="$1" awk '{ if (substr($0, 67) == ENVIRON["RELP"]) h = substr($0, 1, 64) } END { print h }' "$MANIFEST"
+}
+manifest_add() { printf '%s  %s\n' "$1" "$2" >>"$MANIFEST"; }
+# --verify for a file that is already in place (same size and time): True if it is what the image
+# gives. The reference is the manifest; without an entry it is computed from the image.
+existing_ok() {
+  local dst=$1 rel=$2 id=$3 want fmap
+  want="$(manifest_hash "$rel")"
+  if [[ -z $want ]]; then
+    fmap="$(file_map "${id%%-*}")" || return 1
+    want="$(file_stream "$fmap" "$id" | sha256sum | cut -d' ' -f1)"
+    verify_file "$dst" "$want" || return 1
+    manifest_add "$want" "$rel"
+    return 0
+  fi
+  verify_file "$dst" "$want"
+}
 extract_files() {
-  local tsv=$1 only_intact=$2 state id size mt path dst epoch fmap kind suspect copied=0 skipped=0
+  local tsv=$1 only_intact=$2 state id size mt path dst epoch fmap kind suspect rel got copied=0 skipped=0 verified=0 failed=0
   local suspicious="$logs/suspicious-files.txt"
   touch "$suspicious"
   while IFS=$'\t' read -r state id size mt path _; do
@@ -1105,26 +1472,41 @@ extract_files() {
     dst="$(dest_for "$path")"
     [[ -n $dst ]] || continue
     epoch="$(date -d "$mt UTC" +%s)"
+    rel="${dst#"$extract_to"/}"
     if [[ -f $dst && "$(stat -c '%s %Y' "$dst")" == "$size $epoch" ]]; then
-      skipped=$((skipped + 1))
-      continue
+      if ((!verify)) || existing_ok "$dst" "$rel" "$id"; then
+        skipped=$((skipped + 1))
+        continue
+      fi
+      note "  $rel is not what the image gives (it changed after it was extracted): extracting it again"
     fi
-    fmap="$(file_map "${id%%-*}")" || die "MFT entry ${id%%-*} is unreadable: $path"
+    fmap="$(file_map "${id%%-*}")" || die "the entry ${id%%-*} of the file system is unreadable: $path"
     read -r _ _ kind _ <<<"$fmap"
     if [[ $kind == broken ]]; then
-      note "  skipped (the pieces of the file do not add up in the MFT — download again): $path"
+      note "  skipped (the pieces of the file do not add up in the file system — download again): $path"
       continue
     fi
     log "  → $path ($(numfmt --to=si "$size")B)"
     make_dirs "$(dirname "$dst")"
     # The exit status does not matter (grep without a match returns 1): the size check below
     # proves the copy is complete.
-    suspect="$(file_stream "$fmap" "$id" | "${RUN_AS[@]}" tee "$dst.part" |
-      if [[ -n $SUSPECT_RE ]]; then grep -c -aP "$SUSPECT_RE"; else cat >/dev/null; fi)" || true
+    suspect="$(write_stream "$fmap" "$id" "$dst")" || true
     [[ "$(stat -c %s "$dst.part" 2>/dev/null)" == "$size" ]] ||
       die "the size of $dst.part does not match the image ($size): run the command again"
     # shellcheck disable=SC2016 # $1, $2, $3 are expanded by the inner sh
     "${RUN_AS[@]}" sh -c 'mv "$1.part" "$1" && chmod "$3" "$1" && touch -d "$2 UTC" "$1"' _ "$dst" "$mt" "$file_mode"
+    if ((verify)); then
+      got="$(stream_hash)"
+      if [[ -n $got ]] && verify_file "$dst" "$got"; then
+        manifest_add "$got" "$rel"
+        verified=$((verified + 1))
+      else
+        note "  VERIFICATION FAILED, the copy was removed: $path"
+        rm -f -- "$dst"
+        failed=$((failed + 1))
+        continue
+      fi
+    fi
     if ((${suspect:-0})); then
       note "  suspicious data inside (garbage from the disk or a long run of zeros) — better download again"
       printf '%s\n' "$path" >>"$suspicious"
@@ -1133,13 +1515,17 @@ extract_files() {
   done <"$tsv"
   sort -u -o "$suspicious" "$suspicious"
   note "extracted files: $copied, already in place: $skipped"
+  if ((verify)); then
+    note "verified by SHA-256: $verified new files (manifest: $MANIFEST), failed: $failed"
+    ((failed == 0)) || die "$failed files failed verification and were removed: run the command again"
+  fi
   [[ ! -s $suspicious ]] || note "with suspicious data ($(wc -l <"$suspicious")) — download again: $suspicious"
 }
 report() {
   local s e _ damaged="$logs/damaged-files.txt" ranges="$logs/report-ranges.txt"
   note "summary by the map:"
   summary
-  map_ranges "-" >"$ranges"
+  unread_ranges "-" >"$ranges"
   if zones_exist && zones_abandoned; then
     note "abandoned zones: $(zones_text)"
     while read -r s e _; do echo "$s $e"; done <"$zones" >>"$ranges"
@@ -1170,7 +1556,7 @@ extract() {
 # intact files.
 inventory_run() {
   local ranges="$logs/inventory-ranges.txt" tsv="$logs/inventory.tsv" src pair
-  map_ranges "?*/-" >"$ranges"
+  unread_ranges "?*/-" >"$ranges"
   image_prepare
   [[ $FS_STATE == ok ]] || die "no file level for this image (see above)"
   tsk_files | classify "$ranges" >"$tsv"
@@ -1194,22 +1580,281 @@ inventory_run() {
   if ((extract)); then extract_files "$tsv" 1; fi
 }
 
+# --- Garbage in the image ----------------------------------------------------------------------
+
+# The unread ranges of the map of the given block types, plus what the garbage check found
+# (garbage-ranges.txt): files that touch either are damaged.
+unread_ranges() {
+  { map_ranges "$1"; [[ ! -s $logs/garbage-ranges.txt ]] || cat "$logs/garbage-ranges.txt"; } | merge_ranges /dev/stdin
+}
+# Sectors of the image where the garbage pattern matches, as merged "START END" ranges.
+scan_garbage() {
+  LC_ALL=C grep -aboP -- "$GARBAGE_RE" "$img" 2>/dev/null | cut -d: -f1 |
+    awk -v ss="$SECTOR" '$1 ~ /^[0-9]+$/ { s = int($1 / ss) * ss; print s, s + ss }' | merge_ranges /dev/stdin || true
+}
+# mark_map_ranges RANGES: the finished (+) parts of the map inside the ranges become bad sectors (-).
+mark_map_ranges() {
+  local a len t line
+  {
+    awk '/^#/ { print; next } ++n == 1 { print; next } { exit }' "$map"
+    RANGES="$1" awk '
+      function num(s,   i, c, v) {
+        if (s !~ /^0[xX]/) return s + 0
+        v = 0; s = tolower(substr(s, 3))
+        for (i = 1; i <= length(s); i++) { c = index("0123456789abcdef", substr(s, i, 1)) - 1; v = v * 16 + c }
+        return v }
+      function emit(a, b, t) {
+        if (have && pt == t && pe == a) { pe = b } else { flush(); ps = a; pe = b; pt = t; have = 1 } }
+      function flush() { if (have) printf "%.0f %.0f %s\n", ps, pe - ps, pt }
+      BEGIN { while ((getline l < ENVIRON["RANGES"]) > 0) { split(l, r, " "); n++; rs[n] = r[1] + 0; re[n] = r[2] + 0 } }
+      /^#/ { next }
+      ++line == 1 { next }
+      { pos = num($1); end = pos + num($2); st = $3
+        if (st != "+") { emit(pos, end, st); next }
+        cur = pos
+        for (i = 1; i <= n && cur < end; i++) {
+          if (re[i] <= cur) continue
+          if (rs[i] >= end) break
+          if (rs[i] > cur) emit(cur, rs[i], "+")
+          a = (rs[i] > cur ? rs[i] : cur); b = (re[i] < end ? re[i] : end)
+          emit(a, b, "-"); cur = b }
+        if (cur < end) emit(cur, end, "+") }
+      END { flush() }' "$map" | while read -r a len t; do printf '0x%X  0x%X  %s\n' "$a" "$len" "$t"; done
+  } >"$map.new"
+  mv -f "$map.new" "$map"
+}
+# The phase of --recheck-garbage. First time: scan, mark what looks like garbage as bad sectors so
+# that the retry phase reads those sectors again. Second time (after the retry): scan again; what is
+# still garbage is kept in garbage-ranges.txt and counts as unreadable for the file level.
+garbage_run() {
+  local g="$logs/garbage-ranges.txt" new="$TMPD/garbage-new.txt" total count
+  CUR_PHASE=garbage
+  write_state running
+  note "garbage check: scanning the image for the suspect pattern"
+  scan_garbage >"$new"
+  count="$(wc -l <"$new")"
+  total="$(awk '{s += $2 - $1} END {printf "%.0f", s}' "$new")"
+  if [[ ! -e $logs/garbage.marked ]]; then
+    if ((count == 0)); then
+      note "garbage check: nothing found"
+      : >"$g"
+      touch "$logs/garbage.marked" "$logs/garbage.done"
+      return 0
+    fi
+    note "garbage check: $count places ($(numfmt --to=iec "$total")B) look like garbage: marked as bad sectors, the retry phase reads them again"
+    cp "$new" "$logs/garbage-first.txt"
+    mark_map_ranges "$new"
+    rm -f "$logs/retry.done"
+    touch "$logs/garbage.marked"
+    return 0
+  fi
+  cp "$new" "$g"
+  note "garbage check: after the new read $count places ($(numfmt --to=iec "$total")B) still look like garbage — counted as unreadable"
+  # What the earlier report and extraction decided is out of date now.
+  rm -f "${logs:?}/files.tsv" "${logs:?}/report.done" "${logs:?}/extract.done"
+  touch "$logs/garbage.done"
+  notify phase-done "garbage check finished: $count places still look like garbage"
+}
+
+# --- Metadata first -------------------------------------------------------------------------------
+
+# Little-endian integer of LEN bytes at byte OFFSET of the image.
+img_le() {
+  local -a b
+  local v=0 i
+  read -ra b < <(od -An -tu1 -v -j "$1" -N "$2" "$img" 2>/dev/null)
+  for ((i = ${#b[@]} - 1; i >= 0; i--)); do v=$((v * 256 + b[i])); done
+  printf '%s' "$v"
+}
+# Byte offsets of the partitions of the image (mmls), one per line; fails if there is no table.
+mmls_starts() {
+  local mm unit s
+  mm="$(mmls -b "$SECTOR" "$img" 2>/dev/null)" || return 1
+  [[ -n $mm ]] || return 1
+  unit="$(sed -n 's/^Units are in \([0-9]*\)-byte sectors.*/\1/p' <<<"$mm")"
+  unit=${unit:-512}
+  while read -r s; do
+    echo $((10#$s * unit))
+  done < <(awk '/^[0-9]+:/ && $2 != "Meta" && $2 != "-------" {print $3}' <<<"$mm")
+}
+# NTFS geometry from the boot sector at byte START of the image: "CLUSTER MFT_BYTE MIRROR_BYTE RECORD"
+# (offsets relative to START, sizes in bytes); fails if it is not an NTFS boot sector.
+ntfs_geometry() {
+  local s=$1 bps spc mft mir cpr cluster rec
+  [[ "$(dd if="$img" bs=1 skip=$((s + 3)) count=8 status=none 2>/dev/null)" == "NTFS    " ]] || return 1
+  bps="$(img_le $((s + 11)) 2)"
+  spc="$(img_le $((s + 13)) 1)"
+  mft="$(img_le $((s + 48)) 8)"
+  mir="$(img_le $((s + 56)) 8)"
+  cpr="$(img_le $((s + 64)) 1)"
+  ((spc < 128)) || spc=$((1 << (256 - spc)))
+  ((bps >= 512 && bps <= 4096 && spc >= 1)) || return 1
+  cluster=$((bps * spc))
+  if ((cpr < 128)); then rec=$((cpr * cluster)); else rec=$((1 << (256 - cpr))); fi
+  ((rec >= 256 && rec <= 65536)) || return 1
+  echo "$cluster $((mft * cluster)) $((mir * cluster)) $rec"
+}
+# The data runs of the attributes of type TYPE (128 data, 160 index allocation) of MFT entry REC as
+# "START END" byte ranges. The attribute is recognised by its number: on an image whose $AttrDef has
+# not been read yet, TSK cannot name the types and prints "?".
+attr_ranges() {
+  istat -r "${TSK_O[@]}" "$img" "$1" 2>/dev/null | awk -v t="$2" -v cs="$CLUSTER" -v off="$FS_OFFSET" '
+    /^Type: / { cur = (index($3, "(" t "-") == 1); next }
+    cur && /Starting address:/ { gsub(/,/, ""); if ($6 != "Sparse" && $6 != "Filler") printf "%.0f %.0f\n", off + $3 * cs, off + ($3 + $5) * cs }'
+}
+# The runs of the directory index of a directory (MFT entry REC).
+dir_index_ranges() { attr_ranges "$1" 160; }
+# meta_rescue LABEL RANGES_FILE: reads those ranges first (the deferred zones stay out).
+meta_rescue() {
+  [[ -s $2 ]] || return 0
+  merge_ranges "$2" >"$2.merged"
+  mv -f "$2.merged" "$2"
+  note "metadata first: $1 ($(numfmt --to=iec "$(awk '{s += $2 - $1} END {printf "%.0f", s}' "$2")")B)"
+  TARGET_RANGES=$2
+  PRIORITY_MODE=1
+  rescue_ranges
+  TARGET_RANGES=""
+  PRIORITY_MODE=0
+}
+meta_pending() {
+  local p
+  ((meta_first && !no_fs)) || return 1
+  tsk_available || return 1
+  [[ -f $map ]] || return 0
+  has non-tried || return 1
+  [[ -e $logs/meta.done ]] || return 0
+  for p in "${firsts[@]}"; do
+    grep -Fx -- "$p" "$logs/first.done" >/dev/null 2>&1 || return 0
+  done
+  return 1
+}
+# The phase that comes before the ordinary copy: what is needed to know the files (the partition
+# table, boot sectors, $MFT, directory indexes) is read first, then the data of the --first paths.
+# Everything else follows in the ordinary order. Done once (meta.done); new --first paths later.
+meta_run() {
+  local r="$logs/meta-ranges.txt" st first_ids id pass dirs rec p cluster mft mir recsize
+  local -a starts=() newdirs=()
+  local -A seen=()
+  CUR_PHASE=meta
+  write_state running
+  if [[ ! -f $map ]]; then printf '# %s\n0x00000000  ?  1\n0x00000000  0x%X  ?\n' "$PROG" "$PART_SIZE" >"$map"; fi
+  [[ -f $img ]] || : >"$img"
+  if [[ ! -e $logs/meta.done ]]; then
+    printf '0 %s\n' "$((PART_SIZE < 1048576 ? PART_SIZE : 1048576))" >"$r"
+    meta_rescue "the start of the disk (partition table)" "$r"
+    if (($(stat -c %s "$img") < PART_SIZE)); then truncate -s "$PART_SIZE" "$img" || die "cannot extend $img to the size of the device"; fi
+    mapfile -t starts < <(mmls_starts || echo 0)
+    : >"$r"
+    for st in "${starts[@]}"; do printf '%s %s\n' "$st" "$((st + 65536))" >>"$r"; done
+    meta_rescue "boot sectors" "$r"
+    : >"$r"
+    for st in "${starts[@]}"; do
+      if read -r cluster mft mir recsize < <(ntfs_geometry "$st"); then
+        printf '%s %s\n' "$((st + mft))" "$((st + mft + (recsize * 16 > 1048576 ? recsize * 16 : 1048576)))" >>"$r"
+        printf '%s %s\n' "$((st + mir))" "$((st + mir + recsize * 4))" >>"$r"
+      fi
+    done
+    meta_rescue "the start of the MFT" "$r"
+    image_prepare
+    if [[ $FS_STATE != ok ]]; then
+      note "metadata first: no NTFS volume to read first — the ordinary order follows"
+      ((${#firsts[@]} == 0)) || printf '%s\n' "${firsts[@]}" >>"$logs/first.done"
+      touch "$logs/meta.done"
+      return 0
+    fi
+    if [[ $FS_KIND != ntfs ]]; then
+      note "metadata first: only NTFS volumes are read this way (this one is $(fs_type "$FSOUT")) — the ordinary order follows"
+      ((${#firsts[@]} == 0)) || printf '%s\n' "${firsts[@]}" >>"$logs/first.done"
+      touch "$logs/meta.done"
+      return 0
+    fi
+    # TSK names attribute types and finds directory indexes through $AttrDef: without its data the
+    # volume cannot be walked at all. ($Volume and $UpCase are small and TSK reads them too.)
+    : >"$r"
+    for rec in 3 4 10; do attr_ranges "$rec" 128 >>"$r"; done
+    meta_rescue "system files (\$Volume, \$AttrDef, \$UpCase)" "$r"
+    file_byte_ranges 0 >"$r"
+    if [[ -s $r ]]; then
+      meta_rescue "the \$MFT" "$r"
+    else
+      note "metadata first: the extent of the \$MFT could not be determined"
+    fi
+    # Directory indexes: each pass lists the directories that can be reached now, reads the indexes of
+    # the new ones, and the next pass reaches the directories below them.
+    seen[5]=1
+    dir_index_ranges 5 >"$r"
+    meta_rescue "directory indexes (the root)" "$r"
+    for pass in 1 2 3 4 5 6 7 8; do
+      dirs="$(fls -r -p -u -D "${TSK_O[@]}" "$img" 2>/dev/null | awk '$1 ~ /^d\/d/ {split($2, a, "-"); print a[1]}' | sort -u)"
+      newdirs=()
+      for rec in $dirs; do
+        [[ -n ${seen[$rec]:-} ]] || {
+          seen[$rec]=1
+          newdirs+=("$rec")
+        }
+      done
+      ((${#newdirs[@]})) || break
+      : >"$r"
+      for rec in "${newdirs[@]}"; do dir_index_ranges "$rec" >>"$r"; done
+      meta_rescue "directory indexes (pass $pass, ${#newdirs[@]} directories)" "$r"
+    done
+    touch "$logs/meta.done"
+  else
+    image_prepare
+    if [[ $FS_STATE != ok || $FS_KIND != ntfs ]]; then
+      note "metadata first: no NTFS volume, --first has nothing to read"
+      ((${#firsts[@]} == 0)) || printf '%s\n' "${firsts[@]}" >>"$logs/first.done"
+      return 0
+    fi
+  fi
+  for p in "${firsts[@]}"; do
+    grep -Fx -- "$p" "$logs/first.done" >/dev/null 2>&1 && continue
+    first_ids="$(tsk_files | PFX="$p" awk -F'\t' '{ pf = ENVIRON["PFX"]; if ($2 == pf || index($2, pf "/") == 1) print $1 }')"
+    : >"$r"
+    for id in $first_ids; do file_byte_ranges "$id" >>"$r"; done
+    if [[ -s $r ]]; then
+      meta_rescue "the data of --first $p" "$r"
+    else
+      note "metadata first: nothing found under --first $p"
+    fi
+    printf '%s\n' "$p" >>"$logs/first.done"
+  done
+  note "metadata first: finished — $(status_short)"
+}
+
 # --- Targeted recovery -----------------------------------------------------------------------------
 
 # Where the data of a file lies: "START END" (bytes) per piece of file_map.
 file_byte_ranges() {
-  { file_map "${1%%-*}" || true; } | awk -v cs="$CLUSTER" 'NR > 1 && $2 != "-" { printf "%.0f %.0f\n", $2 * cs, ($2 + $3) * cs }'
+  { file_map "${1%%-*}" || true; } | awk -v cs="$CLUSTER" -v off="$FS_OFFSET" 'NR > 1 && $2 != "-" { printf "%.0f %.0f\n", off + $2 * cs, off + ($2 + $3) * cs }'
 }
 # The ddrescue domain from the ranges RANGES: they are "+", the rest is outside the domain.
+# The ranges of KEEP without the ranges of SUB (files of "START END" lines, ascending, merged).
+subtract_ranges() {
+  awk 'FNR == NR { zs[++n] = $1; ze[n] = $2; next }
+       { s = $1; e = $2
+         for (i = 1; i <= n; i++) {
+           if (ze[i] <= s) continue
+           if (zs[i] >= e) break
+           if (zs[i] > s) print s, zs[i]
+           if (ze[i] > s) s = ze[i]
+           if (s >= e) break }
+         if (s < e) print s, e }' "$2" "$1"
+}
 write_ranges_domain() {
-  local pos=0 s e
+  local pos=0 s e merged="$TMPD/ranges-merged.txt"
+  merge_ranges "$1" >"$merged"
+  if ((PRIORITY_MODE)) && zones_exist; then
+    subtract_ranges "$merged" "$zones" >"$merged.cut"
+    mv -f "$merged.cut" "$merged"
+  fi
   {
     printf '# %s: ddrescue domain (selected files)\n0x00000000  +  1\n' "$PROG"
     while read -r s e; do
       ((s <= pos)) || printf '0x%X  0x%X  ?\n' "$pos" "$((s - pos))"
       printf '0x%X  0x%X  +\n' "$s" "$((e - s))"
       pos=$e
-    done < <(merge_ranges "$1")
+    done <"$merged"
     ((pos >= PART_SIZE)) || printf '0x%X  0x%X  ?\n' "$pos" "$((PART_SIZE - pos))"
   } >"$domain"
 }
@@ -1257,13 +1902,51 @@ ui_checklist() {
   LC_ALL=C.UTF-8 whiptail --backtitle "$PROG — file selection" --title "$PROG" --separate-output \
     --checklist "$text" "$h" "$w" "$((h - 8))" "${args[@]}" 3>&1 1>&2 2>&3 </dev/tty >/dev/tty
 }
+# Reads only the ranges listed in the file TARGET_RANGES ("START END" lines): copy, scrape and
+# retry inside them, under the watchdog, with the recovery of a dropped disk. The body shared by
+# targeted recovery and the metadata-first phase.
+rescue_ranges() {
+  local retried=0 phase rc p before
+  while :; do
+    if has_in non-tried; then
+      phase=copy
+    elif has_in non-trimmed || has_in non-scraped; then
+      phase=scrape
+    elif has_in bad-sector && ((!retried)); then
+      phase=retry
+    else
+      break
+    fi
+    device_ok || recover_device || die_device
+    p="$(temperature)" || p=""
+    if [[ -n $p ]] && ((p >= stop)); then wait_cool; fi
+    before="$(status_short)"
+    rc=0
+    run_ddrescue "$phase" || rc=$?
+    if ((rc == 11)) || ! device_ok; then
+      notify dropped "the disk dropped"
+      revert_artifacts
+      p="$(hang_position "$RATES")"
+      [[ -z $p ]] || zone_hang "$((p))" copy
+      [[ "$(status_short)" == "$before" ]] || recoveries=0
+      recover_device || die_device
+      continue
+    fi
+    [[ "$(status_short)" == "$before" ]] || recoveries=0
+    case $rc in
+      0) [[ $phase != retry ]] || retried=1 ;;
+      10) wait_cool ;;
+      *) die "ddrescue exited with code $rc; logs: $logs" ;;
+    esac
+  done
+}
 targeted_run() {
   local cand="$logs/target-candidates.tsv" sel="$logs/target-selected.tsv" unread="$logs/target-unread.txt"
-  local ranges="$logs/target-ranges.txt" n state id size path miss retried=0 phase rc p before tag pat choice
+  local ranges="$logs/target-ranges.txt" n state id size path miss tag pat choice
   local -a items=() tags=()
   image_prepare
   [[ $FS_STATE == ok ]] || die "no file level for this image (see above)"
-  map_ranges "?*/-" >"$unread"
+  unread_ranges "?*/-" >"$unread"
   # Candidates are the incomplete files. With an inventory only its incomplete files are rechecked
   # (fast), without one all files of the volume (minutes).
   note "looking for incomplete files…"
@@ -1298,45 +1981,416 @@ targeted_run() {
   : >"$ranges"
   while IFS=$'\t' read -r _ id _; do file_byte_ranges "$id" >>"$ranges"; done <"$sel"
   TARGET_RANGES=$ranges
-  while :; do
-    if has_in non-tried; then
-      phase=copy
-    elif has_in non-trimmed || has_in non-scraped; then
-      phase=scrape
-    elif has_in bad-sector && ((!retried)); then
-      phase=retry
-    else
-      break
-    fi
-    device_ok || recover_device || die_device
-    p="$(temperature)" || p=""
-    if [[ -n $p ]] && ((p >= stop)); then wait_cool; fi
-    before="$(status_short)"
-    rc=0
-    run_ddrescue "$phase" || rc=$?
-    if ((rc == 11)) || ! device_ok; then
-      revert_artifacts
-      p="$(hang_position "$RATES")"
-      [[ -z $p ]] || zone_hang "$((p))" copy
-      [[ "$(status_short)" == "$before" ]] || recoveries=0
-      recover_device || die_device
-      continue
-    fi
-    [[ "$(status_short)" == "$before" ]] || recoveries=0
-    case $rc in
-      0) [[ $phase != retry ]] || retried=1 ;;
-      10) wait_cool ;;
-      *) die "ddrescue exited with code $rc; logs: $logs" ;;
-    esac
-  done
+  rescue_ranges
   TARGET_RANGES=""
   # What the earlier report and extraction decided is out of date now: a normal run does them again.
   rm -f "${logs:?}/files.tsv" "${logs:?}/report.done" "${logs:?}/extract.done"
-  map_ranges "?*/-" >"$unread"
+  unread_ranges "?*/-" >"$unread"
   awk -F'\t' '{print $2 "\t" $5}' "$sel" | classify "$unread" >"$logs/target-result.tsv"
   note "result of targeted recovery:"
   awk -F'\t' '{printf "  %s  %s\n", ($1 == "intact" ? "whole     " : "incomplete"), $5}' "$logs/target-result.tsv"
   if ((extract)); then extract_files "$logs/target-result.tsv" 1; fi
+}
+
+# --- Triage ---------------------------------------------------------------------------------------
+
+tri_note() { TRI_NOTES+=("$*"); }
+tri_warn() { TRI_WARN+=("$*"); }
+tri_red() { TRI_RED+=("$*"); }
+# The raw value of an ATA SMART attribute (by id) in a smartctl JSON document; empty if absent.
+smart_attr() { jq -r --argjson id "$2" '[.ata_smart_attributes.table[]? | select(.id == $id) | .raw.value][0] // empty' <<<"$1"; }
+# Reads a smartctl JSON document (-j -i -H -A): prints the facts, records findings.
+triage_smart_json() {
+  local j=$1 passed model poh temp realloc pend unc crc rep crit media used spare
+  model="$(jq -r '.model_name // empty' <<<"$j")"
+  passed="$(jq -r '.smart_status.passed | if . == null then "" else tostring end' <<<"$j")"
+  poh="$(jq -r '.power_on_time.hours // empty' <<<"$j")"
+  temp="$(jq -r '.temperature.current // empty' <<<"$j")"
+  [[ -z $model ]] || log "  model:          $model"
+  [[ -z $poh ]] || log "  power-on time:  $poh h"
+  [[ -z $temp ]] || log "  temperature:    $temp °C"
+  case $passed in
+    true) log "  SMART health:   passed" ;;
+    false)
+      log "  SMART health:   FAILED"
+      tri_warn "SMART overall health is FAILED: the disk predicts its own failure — image it now"
+      ;;
+    *) log "  SMART health:   not reported" ;;
+  esac
+  realloc="$(smart_attr "$j" 5)"
+  rep="$(smart_attr "$j" 187)"
+  pend="$(smart_attr "$j" 197)"
+  unc="$(smart_attr "$j" 198)"
+  crc="$(smart_attr "$j" 199)"
+  [[ -z $realloc ]] || log "  reallocated:    $realloc sectors"
+  [[ -z $pend ]] || log "  pending:        $pend sectors"
+  [[ -z $unc ]] || log "  uncorrectable:  $unc sectors (offline)"
+  [[ -z $crc ]] || log "  interface CRC:  $crc errors"
+  if [[ $pend =~ ^[0-9]+$ ]] && ((pend > 0)); then tri_warn "$pend sectors are pending (unreadable until rewritten): expect unreadable areas"; fi
+  if [[ $unc =~ ^[0-9]+$ ]] && ((unc > 0)); then tri_warn "$unc sectors are offline-uncorrectable: expect unreadable areas"; fi
+  if [[ $rep =~ ^[0-9]+$ ]] && ((rep > 0)); then tri_warn "$rep uncorrectable read errors were reported by the disk"; fi
+  if [[ $realloc =~ ^[0-9]+$ ]] && ((realloc > 1000)); then
+    tri_warn "$realloc reallocated sectors: the surface is heavily worn"
+  elif [[ $realloc =~ ^[0-9]+$ ]] && ((realloc > 0)); then
+    tri_note "$realloc reallocated sectors"
+  fi
+  if [[ $crc =~ ^[0-9]+$ ]] && ((crc > 0)); then tri_warn "$crc interface CRC errors: check the cable, the connector or the USB bridge"; fi
+  crit="$(jq -r '.nvme_smart_health_information_log.critical_warning // empty' <<<"$j")"
+  media="$(jq -r '.nvme_smart_health_information_log.media_errors // empty' <<<"$j")"
+  used="$(jq -r '.nvme_smart_health_information_log.percentage_used // empty' <<<"$j")"
+  spare="$(jq -r '.nvme_smart_health_information_log.available_spare // empty' <<<"$j")"
+  if [[ -n $crit$media$used ]]; then
+    log "  NVMe:           critical warning $crit, media errors $media, used $used%, spare $spare%"
+    if [[ $crit =~ ^[0-9]+$ ]] && ((crit != 0)); then tri_warn "NVMe critical warning flags are set ($crit)"; fi
+    if [[ $media =~ ^[0-9]+$ ]] && ((media > 0)); then tri_warn "NVMe reports $media media errors"; fi
+    if [[ $used =~ ^[0-9]+$ ]] && ((used >= 100)); then tri_note "NVMe endurance used: $used%"; fi
+  fi
+}
+# Sample offsets (bytes, multiples of 1 MiB) for a device of SIZE bytes: the start, seven points in
+# between, the end.
+triage_positions() {
+  local size=$1 m=1048576 i pos
+  {
+    for i in 0 1 2 3 4 5 6 7 8; do
+      pos=$((size * i / 8 / m * m))
+      ((pos + m <= size)) || continue
+      echo "$pos"
+    done
+    ((size < m)) || echo $(((size - m) / m * m))
+  } | sort -n -u
+}
+# Reads 1 MiB at POS with a limit; a read that does not return in --triage-timeout seconds is
+# abandoned (a hung disk may keep it stuck for the kernel's own timeout). Sets TRI_RES (ok, slow,
+# error, timeout) and TRI_MS.
+triage_read() {
+  local pos=$1 t0 t1 pid waited=0 max=$((triage_timeout * 10)) rc=0
+  t0="$(date +%s%N)"
+  dd if="$dev" of=/dev/null bs=1M count=1 skip=$((pos / 1048576)) iflag=direct status=none 2>/dev/null 8>&- &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    if ((waited >= max)); then
+      kill -TERM "$pid" 2>/dev/null || true
+      disown "$pid" 2>/dev/null || true
+      TRI_RES=timeout
+      TRI_MS=$((triage_timeout * 1000))
+      return 0
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  wait "$pid" || rc=$?
+  t1="$(date +%s%N)"
+  TRI_MS=$(((t1 - t0) / 1000000))
+  if ((rc != 0)); then TRI_RES=error; elif ((TRI_MS > 1000)); then TRI_RES=slow; else TRI_RES=ok; fi
+}
+# SMART through smartctl: plain first, then -d sat (a SATA disk behind a USB bridge); the facts
+# and findings come from triage_smart_json. Without smartctl or jq, or with no SMART at all, a note.
+triage_smart_collect() {
+  local out="" type got=0
+  SMART_TYPE_FOUND=""
+  if ! command -v smartctl >/dev/null || ! command -v jq >/dev/null; then
+    tri_note "smartctl or jq is missing: no SMART data (apt install smartmontools jq)"
+    return 0
+  fi
+  local -a types=("${smart_type:-}")
+  [[ -n $smart_type ]] || types+=(sat)
+  for type in "${types[@]}"; do
+    local -a args=()
+    [[ -z $type ]] || args=(-d "$type")
+    out="$(timeout 30 smartctl -j -i -H -A "${args[@]}" "$whole" 2>/dev/null || true)"
+    if jq -e '.smart_status or .ata_smart_attributes or .nvme_smart_health_information_log' <<<"$out" >/dev/null 2>&1; then
+      got=1
+      SMART_TYPE_FOUND=$type
+      break
+    fi
+  done
+  if ((got)); then
+    triage_smart_json "$out"
+  else
+    tri_note "no SMART data from this device (a virtual disk, or a USB bridge that hides it: try --smart-type)"
+  fi
+}
+# Kernel messages about the disk: link problems of its ATA port and I/O errors. Prints the lines
+# and records findings; silent if the log cannot be read.
+triage_dmesg() {
+  local port="" resets errs text
+  text="$(dmesg 2>/dev/null)" || return 0
+  [[ -n $text ]] || return 0
+  port="$(readlink -f "/sys/block/$parent/device" 2>/dev/null | sed -n 's|.*/ata\([0-9][0-9]*\)/.*|\1|p' | head -1)"
+  if [[ -n $port ]]; then
+    resets="$(grep -E "ata$port(\\.[0-9]+)?: " <<<"$text" | grep -Ec 'hard resetting link|COMRESET failed|failed command|SError|link is slow' || true)"
+    log "  kernel log:     $resets link/command problems on ata$port"
+    if ((resets >= 3)); then
+      tri_warn "the kernel logged $resets link or command problems on ata$port: the link is unstable (try a slower link: libata.force=$port:1.5Gbps, see the README)"
+    fi
+  fi
+  errs="$(grep -Ec "I/O error, dev $parent\\b" <<<"$text" || true)"
+  if ((errs > 0)); then
+    log "  kernel log:     $errs I/O errors for $parent"
+    tri_warn "the kernel logged $errs I/O errors for $parent"
+  fi
+}
+# --triage SOURCE: a short, read-only check with a verdict.
+triage_run() {
+  local c
+  for c in lsblk blockdev dd; do command -v "$c" >/dev/null || die "missing command: $c"; done
+  ((EUID == 0)) || die "root is needed to read the device: run through sudo"
+  [[ -n $source_arg ]] || die "no source: give a device (see --help)"
+  [[ -b $source_arg ]] || die "no block device $source_arg"
+  resolve_device
+  PART_SIZE="$(blockdev --getsize64 "$dev")"
+  log "$PROG triage of $source_arg"
+  log "  device:         $dev (disk $whole), $(gb "$PART_SIZE"), sector $SECTOR, ${TRANSPORT:-no transport}"
+  local rota mounted
+  rota="$(lsblk -dno ROTA "$whole" 2>/dev/null | head -1 | tr -d ' ')"
+  [[ -z $rota ]] || log "  kind:           $([[ $rota == 1 ]] && echo 'rotating disk' || echo 'no rotating platters (SSD, flash, virtual)')"
+  mounted="$( (findmnt -n -o TARGET -S "$dev" || true; lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null || true) | awk 'NF' | sort -u | paste -sd ' ')" || mounted=""
+  if [[ -n $mounted ]]; then
+    log "  mounted:        $mounted"
+    tri_warn "the source is mounted ($mounted): unmount it (or do not use it) before rescuing"
+  fi
+  ((PART_SIZE > 0)) || tri_red "the device reports no size"
+  triage_smart_collect
+  triage_dmesg
+  # sample reads
+  log "  sample reads (1 MiB each, at most ${triage_timeout} s per read):"
+  local pos fails=0 slow=0 bad=0 sampled=0 ms rate
+  while read -r pos; do
+    triage_read "$pos"
+    sampled=$((sampled + 1))
+    ms=$TRI_MS
+    rate="$(awk -v ms="$ms" 'BEGIN { if (ms > 0) printf "%.1f MB/s", 1048.576 / ms; else print "-" }')"
+    log "    $(printf '%8s' "$(numfmt --to=si "$pos")B"): $(printf '%-7s' "$TRI_RES") ${ms} ms ($rate)"
+    case $TRI_RES in
+      ok) fails=0 ;;
+      slow)
+        slow=$((slow + 1))
+        fails=0
+        ;;
+      error | timeout)
+        bad=$((bad + 1))
+        fails=$((fails + 1))
+        ;;
+    esac
+    if ((fails >= 2)); then
+      log "    two failures in a row: not reading any more"
+      break
+    fi
+    if [[ $TRI_RES == timeout ]]; then
+      log "    no answer: the disk is hung, not reading any more"
+      break
+    fi
+  done < <(triage_positions "$PART_SIZE")
+  ((bad == 0)) || tri_warn "$bad of $sampled sample reads failed or timed out"
+  ((slow == 0)) || tri_warn "$slow of $sampled sample reads were slow (more than a second per MiB)"
+  if ((sampled > 0 && bad == sampled)) || ((fails >= 2)) || [[ $TRI_RES == timeout ]]; then
+    tri_red "the disk does not answer reads (${bad} of ${sampled} sample reads failed or hung)"
+  fi
+  local verdict=GREEN f
+  ((${#TRI_WARN[@]} == 0)) || verdict=YELLOW
+  ((${#TRI_RED[@]} == 0)) || verdict=RED
+  log ""
+  for f in "${TRI_RED[@]}"; do log "  RED:    $f"; done
+  for f in "${TRI_WARN[@]}"; do log "  WARN:   $f"; done
+  for f in "${TRI_NOTES[@]}"; do log "  note:   $f"; done
+  case $verdict in
+    RED)
+      log "Verdict: RED — the disk barely answers. If the data matters, stop now and consider a data"
+      log "recovery lab: every extra minute of running costs data. If you go on anyway, expect hangs and"
+      log "power cycles, use /dev/disk/by-id/... and read the README (\"When not to use it\")."
+      ;;
+    YELLOW)
+      log "Verdict: YELLOW — workable, with trouble expected (unreadable areas, slow places or an unstable link)."
+      log "That is what $PROG is for; image it soon and do not run anything else on this disk."
+      ;;
+    *) log "Verdict: GREEN — nothing alarming in this short check. It is a heuristic, not a guarantee." ;;
+  esac
+  log "Suggested start:"
+  local opts=""
+  [[ -z $SMART_TYPE_FOUND ]] || opts+=" --smart-type $SMART_TYPE_FOUND"
+  ((slow == 0 && bad == 0)) || opts+=" --min-rate 1M --skip-size 1Mi"
+  log "  sudo $PROG $source_arg --dir /path/on/another/disk --name NAME$opts"
+  [[ $verdict != RED ]] || return 4
+}
+
+# --- Status ---------------------------------------------------------------------------------------
+
+# Progress sampling for the rate and the state file: the rescued bytes of the map, a sliding
+# window of ten minutes. (The rate log of ddrescue is written only when it exits, so it cannot be
+# used while it runs.)
+sample_progress() {
+  [[ -f $map ]] || return 0
+  local now=$SECONDS b
+  b="$(map_totals "$map" | sed -n 's/^rescued=\([0-9]*\) .*/\1/p')"
+  [[ -n $b ]] || return 0
+  RESCUED=$b
+  RATE_T+=("$now")
+  RATE_B+=("$b")
+  while ((${#RATE_T[@]} > 1 && now - RATE_T[0] > 600)); do
+    RATE_T=("${RATE_T[@]:1}")
+    RATE_B=("${RATE_B[@]:1}")
+  done
+  if ((${#RATE_T[@]} > 1 && now > RATE_T[0])); then RATE=$(((b - RATE_B[0]) / (now - RATE_T[0]))); else RATE=0; fi
+  ((RATE >= 0)) || RATE=0
+}
+# Bytes per kind of block of a map: "rescued=… non_tried=… non_trimmed=… non_scraped=… bad=…".
+map_totals() {
+  awk '
+    function num(s,   i, c, v) {
+      if (s !~ /^0[xX]/) return s + 0
+      v = 0; s = tolower(substr(s, 3))
+      for (i = 1; i <= length(s); i++) { c = index("0123456789abcdef", substr(s, i, 1)) - 1; v = v * 16 + c }
+      return v }
+    !/^#/ && ++n > 1 { t[$3] += num($2) }
+    END { printf "rescued=%.0f non_tried=%.0f non_trimmed=%.0f non_scraped=%.0f bad=%.0f\n", t["+"], t["?"], t["*"], t["/"], t["-"] }' "$1"
+}
+# A duration in seconds as "3 h 12 min".
+fmt_duration() {
+  local sec=$1
+  if ((sec >= 86400)); then
+    printf '%d d %d h' $((sec / 86400)) $((sec % 86400 / 3600))
+  elif ((sec >= 3600)); then
+    printf '%d h %d min' $((sec / 3600)) $((sec % 3600 / 60))
+  elif ((sec >= 60)); then
+    printf '%d min' $((sec / 60))
+  else
+    printf '%d s' "$sec"
+  fi
+}
+state_value() { sed -n "s/^$1=//p" "$logs/state" 2>/dev/null | head -1; }
+# --status: everything comes from the map and the logs; the disk is not touched.
+status_run() {
+  [[ -f $map ]] || die "no map for \"$name\" in $dir (--dir/--name)"
+  PART_SIZE="$(map_size "$map")"
+  domain="$TMPD/domain.map" # next_phase writes a domain file; never into the logs of a running rescue
+  local totals rescued non_tried non_trimmed non_scraped bad unread
+  totals="$(map_totals "$map")"
+  rescued="$(sed -n 's/.*rescued=\([0-9]*\).*/\1/p' <<<"$totals")"
+  non_tried="$(sed -n 's/.*non_tried=\([0-9]*\).*/\1/p' <<<"$totals")"
+  non_trimmed="$(sed -n 's/.*non_trimmed=\([0-9]*\).*/\1/p' <<<"$totals")"
+  non_scraped="$(sed -n 's/.*non_scraped=\([0-9]*\).*/\1/p' <<<"$totals")"
+  bad="$(sed -n 's/.*bad=\([0-9]*\).*/\1/p' <<<"$totals")"
+  unread=$((non_tried + non_trimmed + non_scraped))
+  local running=0 st upd age pid rate temp phase_now eta=""
+  if [[ -e $dir/.$name.lock ]] && ! flock -n -s "$dir/.$name.lock" true 2>/dev/null; then running=1; fi
+  st="$(state_value state)"
+  upd="$(state_value updated)"
+  pid="$(state_value pid)"
+  rate="$(state_value rate)"
+  temp="$(state_value temperature)"
+  age=""
+  [[ $upd =~ ^[0-9]+$ ]] && age=$(($(date +%s) - upd))
+  if ((running == 0)) && [[ $st == running || $st == cooling || $st == starting ]]; then st="stopped (the run is gone)"; fi
+  [[ -n $st ]] || st="no run recorded"
+  # the run's own settings decide whether the metadata-first phase is still ahead of it
+  [[ "$(state_value meta)" != 0 ]] || meta_first=0
+  phase_now="$(next_phase)"
+  if [[ $rate =~ ^[0-9]+$ ]] && ((rate > 0 && running && unread > 0)); then eta=$((unread / rate)); fi
+  local -a events=()
+  [[ ! -f $LOG ]] || mapfile -t events < <(tail -n 5 "$LOG")
+  if ((json)); then
+    command -v jq >/dev/null || die "--json needs jq"
+    local zjson ejson
+    zjson="$( ([[ ! -s $zones ]] || cat "$zones") | jq -Rn '[inputs | split(" ") | select(length >= 4) | {start: (.[0] | tonumber), end: (.[1] | tonumber), direction: .[2], failures: (.[3] | tonumber)}]')"
+    ejson="$(printf '%s\n' "${events[@]}" | jq -R . | jq -s .)"
+    jq -n --arg name "$name" --arg dir "$dir" --arg image "$img" --arg map "$map" \
+      --argjson size "$PART_SIZE" --argjson rescued "$rescued" --argjson non_tried "$non_tried" \
+      --argjson non_trimmed "$non_trimmed" --argjson non_scraped "$non_scraped" --argjson bad "$bad" \
+      --argjson running "$((running == 1))" --arg state "$st" --arg phase "$phase_now" \
+      --argjson pid "$([[ $pid =~ ^[0-9]+$ ]] && echo "$pid" || echo null)" \
+      --argjson updated_seconds_ago "$([[ -n $age ]] && echo "$age" || echo null)" \
+      --argjson rate "$([[ $rate =~ ^[0-9]+$ ]] && echo "$rate" || echo null)" \
+      --argjson eta_seconds "$([[ -n $eta ]] && echo "$eta" || echo null)" \
+      --argjson temperature "$([[ $temp =~ ^[0-9]+$ ]] && echo "$temp" || echo null)" \
+      --argjson zones "$zjson" --argjson zones_given_up "$(zones_abandoned && echo true || echo false)" \
+      --argjson report_done "$([[ -e $logs/report.done ]] && echo true || echo false)" \
+      --argjson extract_done "$([[ -e $logs/extract.done ]] && echo true || echo false)" \
+      --argjson last_events "$ejson" \
+      '{name: $name, dir: $dir, image: $image, map: $map, size: $size, running: ($running == 1), state: $state,
+        pid: $pid, updated_seconds_ago: $updated_seconds_ago, next_phase: $phase,
+        rescued: $rescued, non_tried: $non_tried, non_trimmed: $non_trimmed, non_scraped: $non_scraped, bad: $bad,
+        rescued_percent: (if $size > 0 then (($rescued * 1000 / $size) | floor) / 10 else 0 end),
+        rate_bytes_per_second: $rate, eta_seconds: $eta_seconds, temperature: $temperature,
+        zones: $zones, zones_given_up: $zones_given_up,
+        report_done: $report_done, extract_done: $extract_done, last_events: $last_events}'
+    return 0
+  fi
+  local pct
+  pct="$(awk -v r="$rescued" -v s="$PART_SIZE" 'BEGIN { printf "%.1f", (s > 0 ? r * 100 / s : 0) }')"
+  log "$PROG status: $name"
+  log "  directory:      $dir"
+  if ((running)); then
+    log "  state:          $st (pid ${pid:-?}${age:+, updated $(fmt_duration "$age") ago})"
+  else
+    log "  state:          $st"
+  fi
+  log "  next phase:     $phase_now"
+  log "  rescued:        $pct% ($(gb "$rescued") of $(gb "$PART_SIZE"))"
+  log "  not read yet:   $(gb "$unread") (not tried $(gb "$non_tried"), not trimmed $(gb "$non_trimmed"), not scraped $(gb "$non_scraped"))"
+  log "  unreadable:     $(gb "$bad")"
+  if ((running)) && [[ $rate =~ ^[0-9]+$ ]]; then
+    if ((rate > 0)); then
+      log "  rate:           $(numfmt --to=si "$rate")B/s over the last 10 minutes${eta:+; about $(fmt_duration "$eta") to read what is not read yet (rough)}"
+    else
+      log "  rate:           none at the moment (paused or waiting)"
+    fi
+  fi
+  [[ -z $temp ]] || log "  temperature:    $temp °C"
+  if [[ -s $zones ]]; then
+    log "  deferred zones: $(wc -l <"$zones")$(zones_abandoned && printf ' (given up)'): $(zones_text)"
+  fi
+  log "  report:         $([[ -e $logs/report.done ]] && echo "done" || echo pending)"
+  log "  extraction:     $([[ -e $logs/extract.done ]] && echo "done" || echo "not done")"
+  if ((${#events[@]})); then
+    log "  last events:"
+    printf '    %s\n' "${events[@]}"
+  fi
+}
+
+# --- systemd unit ---------------------------------------------------------------------------------
+
+# A string as one systemd command-line argument: quoted, with \, ", % and $ escaped.
+unit_arg() {
+  local a=$1
+  a=${a//\\/\\\\}
+  a=${a//\"/\\\"}
+  a=${a//%/%%}
+  a=${a//\$/\$\$}
+  printf '"%s"' "$a"
+}
+# Prints a systemd service that runs the current command line (without --print-service). The
+# disk dropping and needing a power cycle (exit 3), stuck zones (2) and a stop by systemctl do not
+# restart the service; other failures restart it a few times. Enabled, it continues by itself
+# after the power cycle.
+service_unit() {
+  local self a line
+  self="$(readlink -f "$0")"
+  line="$(unit_arg "$self")"
+  for a in "${ORIG_ARGS[@]}"; do
+    [[ $a == --print-service ]] || line+=" $(unit_arg "$a")"
+  done
+  cat <<EOF
+# Save as /etc/systemd/system/$PROG-${name:-rescue}.service, then:
+#   systemctl daemon-reload && systemctl enable --now $PROG-${name:-rescue}.service
+# When the rescue is finished: systemctl disable $PROG-${name:-rescue}.service
+[Unit]
+Description=$PROG: rescue of ${name:-a disk}
+After=local-fs.target
+StartLimitIntervalSec=3600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=$line
+Restart=on-failure
+RestartSec=120
+RestartPreventExitStatus=2 3
+KillSignal=SIGTERM
+TimeoutStopSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 # --- Main ----------------------------------------------------------------------------------------
@@ -1348,7 +2402,40 @@ cleanup() {
     wait "$DD_PID" 2>/dev/null || true
   fi
   [[ -z $orig_timeout ]] || echo "$orig_timeout" >"$timeout_file" 2>/dev/null || true
+  restore_readonly
+  if ((RUN_STARTED)); then
+    case $RUN_STATE in
+      done | failed | power-cycle | zones-stuck | stopped) ;;
+      *) write_state stopped ;;
+    esac
+  fi
   [[ -z $TMPD ]] || rm -rf "$TMPD"
+}
+
+# --- Read-only flag ----------------------------------------------------------------------------
+
+# While rescuing, the source gets the kernel's read-only flag: nothing else on this machine (a
+# mount, a stray fsck, a write by mistake) can modify the failing disk. A disk that comes back
+# is a new device and gets the flag again. The original value is restored on exit.
+set_readonly() {
+  ((readonly_flag)) || return 0
+  local cur
+  cur="$(blockdev --getro "$dev" 2>/dev/null)" || {
+    warn "cannot read the read-only flag of $dev"
+    return 0
+  }
+  [[ -n $RO_ORIG ]] || RO_ORIG=$cur
+  [[ $cur != 1 ]] || return 0
+  if blockdev --setro "$dev" 2>/dev/null; then
+    RO_SET=1
+    note "$dev is set read-only for the kernel (restored on exit)"
+  else
+    warn "cannot set $dev read-only: continuing without the kernel's protection"
+  fi
+}
+restore_readonly() {
+  [[ $RO_SET == 1 && $RO_ORIG == 0 && -b $dev ]] || return 0
+  blockdev --setrw "$dev" 2>/dev/null || true
 }
 
 # Mount, location and space checks before the first read.
@@ -1376,14 +2463,25 @@ preflight_device() {
 }
 
 main() {
+  ORIG_ARGS=("$@")
   parse_args "$@"
   if [[ -t 1 ]]; then
     C_RED=$'\e[31m' C_YELLOW=$'\e[33m' C_BOLD=$'\e[1m' C_RESET=$'\e[0m'
   fi
   validate_args
   trap 'on_err $? "$BASH_COMMAND" "$LINENO"' ERR
+  if ((print_service)); then
+    service_unit
+    return 0
+  fi
+  if ((triage)); then
+    TMPD="$(mktemp -d -t "$PROG.XXXXXX")"
+    trap cleanup EXIT
+    triage_run
+    return $?
+  fi
 
-  local cmd z t p
+  local cmd z t p cur_timeout
   for cmd in ddrescue ddrescuelog numfmt flock lsblk blockdev; do
     command -v "$cmd" >/dev/null || die "missing command: $cmd (apt install gddrescue util-linux coreutils)"
   done
@@ -1391,10 +2489,10 @@ main() {
     warn "GNU ddrescue older than 1.27 is untested"
   fi
   if ((!no_fs && (extract || inventory || pick || ${#file_patterns[@]}))) && ! tsk_available; then
-    die "the file level needs The Sleuth Kit (fls, istat, icat, fsstat, ils): apt install sleuthkit"
+    die "the file level needs The Sleuth Kit (fls, istat, icat, fsstat, ils, mmls): apt install sleuthkit"
   fi
-  ((inventory)) || [[ -n $source_arg ]] || die "no source: give a device (see --help)"
-  ((inventory)) || ((EUID == 0)) || die "root is needed to read the device: run through sudo"
+  ((inventory || status)) || [[ -n $source_arg ]] || die "no source: give a device (see --help)"
+  ((inventory || status)) || ((EUID == 0)) || die "root is needed to read the device: run through sudo"
   ((!extract)) || [[ -d $extract_to ]] || die "--extract-to: no such directory: $extract_to"
   [[ -d $dir ]] || die "no such directory: $dir (--dir)"
   dir="$(cd "$dir" && pwd -P)"
@@ -1403,14 +2501,14 @@ main() {
       case $source_arg in
         /dev/disk/* | /dev/mapper/*) ;;
         *)
-          ((inventory)) || die "--name is required unless SOURCE is a stable path such as /dev/disk/by-id/...: the name of $source_arg can change when the disk comes back, and the image would not match the next run"
+          ((inventory || status)) || die "--name is required unless SOURCE is a stable path such as /dev/disk/by-id/...: the name of $source_arg can change when the disk comes back, and the image would not match the next run"
           ;;
       esac
       name="$(basename "$source_arg")"
-    elif ((inventory)); then
+    elif ((inventory || status)); then
       local -a maps_found=()
       mapfile -t maps_found < <(find "$dir" -maxdepth 1 -name '*.map' ! -name '*.before-revert' -printf '%f\n' | sort)
-      ((${#maps_found[@]} == 1)) || die "--inventory: say which image with --name NAME (found ${#maps_found[@]} maps in $dir)"
+      ((${#maps_found[@]} == 1)) || die "say which image with --name NAME (found ${#maps_found[@]} maps in $dir)"
       name="${maps_found[0]%.map}"
     else
       die "no source: give a device (see --help)"
@@ -1423,13 +2521,20 @@ main() {
   zones="$logs/zones"
   domain="$logs/domain.map"
   LOG="$logs/rescue.log"
+  MANIFEST="$logs/manifest.sha256"
   TMPD="$(mktemp -d -t "$PROG.XXXXXX")"
+  STREAM_SHA="$TMPD/stream.sha"
   trap cleanup EXIT
 
+  if ((status)); then
+    status_run
+    return 0
+  fi
   if ((inventory)); then
     # Without the disk: the size of the partition is the end of the map.
     [[ -f $map && -f $img ]] || die "no image or map in $dir for \"$name\""
     PART_SIZE="$(map_size "$map")"
+    if [[ -f $logs/sector-size && "$(cat "$logs/sector-size")" =~ ^[0-9]+$ ]]; then SECTOR="$(cat "$logs/sector-size")"; fi
     if ((DRY_RUN)); then
       info "inventory of $img: $(status_short); dry-run: nothing is run"
       return 0
@@ -1482,10 +2587,15 @@ main() {
   flock -n 8 || die "another run is in progress for \"$name\""
 
   [[ -z $SCSI_HOST ]] || echo "$SCSI_HOST" >"$logs/scsi-host"
+  echo "$SECTOR" >"$logs/sector-size"
   if ((kernel_timeout > 0)); then
     if [[ -w $timeout_file ]]; then
-      orig_timeout="$(cat "$timeout_file")"
-      echo "$kernel_timeout" >"$timeout_file"
+      # only raised: a kernel that already waits longer keeps its own value
+      cur_timeout="$(cat "$timeout_file")"
+      if [[ $cur_timeout =~ ^[0-9]+$ ]] && ((cur_timeout < kernel_timeout)); then
+        orig_timeout=$cur_timeout
+        echo "$kernel_timeout" >"$timeout_file"
+      fi
     else
       warn "cannot change the kernel command timeout of $whole ($timeout_file is not writable here)"
     fi
@@ -1495,9 +2605,13 @@ main() {
     systemd-inhibit --what=sleep:idle:handle-lid-switch --who="$PROG" --why="rescuing $name" sleep infinity 8>&- &
     INHIBIT_PID=$!
   fi
-  trap 'note "interrupted — run the command again, it continues where it stopped"; exit 130' INT TERM
+  trap 'note "interrupted — run the command again, it continues where it stopped"; write_state stopped; notify interrupted "interrupted"; exit 130' INT TERM
 
+  RUN_STARTED=1
+  set_readonly
+  write_state starting
   note "start: stop at $stop °C, continue at $resume °C, check every ${interval}s; kernel command timeout $([[ -n $orig_timeout ]] && echo "$kernel_timeout s (was $orig_timeout s)" || echo unchanged)"
+  notify started "rescue of $name started: $(status_short)"
   # Once: the same zone is not added again, otherwise an already narrowed zone would widen back.
   for z in "${add_zones[@]}"; do
     if grep -Fx -- "$z" "$logs/zones.added" >/dev/null 2>&1; then
@@ -1524,6 +2638,13 @@ main() {
   local phase rc before fails=0 stalls=0 last_phase="" file_level_pending=0
   while phase="$(next_phase)" && [[ $phase != "done" ]]; do
     case $phase in
+      meta)
+        device_ok || recover_device || die_device
+        meta_run
+        ;;
+      garbage)
+        garbage_run
+        ;;
       copy | scrape | retry | zones)
         device_ok || recover_device || die_device
         t="$(temperature)" || t=""
@@ -1532,6 +2653,7 @@ main() {
         rc=0
         run_ddrescue "$phase" || rc=$?
         if ((rc == 11)) || ! device_ok; then
+          notify dropped "the disk dropped"
           revert_artifacts
           p="$(hang_position "$RATES")"
           [[ -z $p ]] || zone_hang "$((p))" "$phase"
@@ -1551,6 +2673,7 @@ main() {
         case $rc in
           0)
             note "phase $phase finished: $(status_short)"
+            notify phase-done "phase $phase finished: $(status_short)"
             [[ $phase != retry ]] || touch "$logs/retry.done"
             if [[ $phase == zones ]]; then
               # The zone is read: from now on it is an ordinary part of the disk, its bad spots go
@@ -1573,6 +2696,8 @@ main() {
       zones-stuck)
         warn "deferred zones remain that the disk does not read from either side: $(zones_text)"
         warn "give them up (files inside will be reported as damaged): run the same command with --give-up-zones added"
+        write_state zones-stuck
+        notify zones-stuck "deferred zones remain that the disk does not read: $(zones_text)"
         exit 2
         ;;
       report)
@@ -1594,9 +2719,13 @@ main() {
   done
   if ((file_level_pending)); then
     note "imaging finished: $(status_short). The file level was not done: install the Sleuth Kit and run the same command again"
+    write_state "done"
+    notify "done" "imaging finished; the file level is pending (install the Sleuth Kit)"
     return 0
   fi
   note "done: $(status_short)"
+  write_state "done"
+  notify "done" "done: $(status_short)"
   if ((!extract)) && [[ -z $extract_to ]]; then
     info "to extract files from the image: $PROG --inventory --name $name --dir $dir --extract --extract-to DIR"
   fi
