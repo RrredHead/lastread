@@ -36,10 +36,10 @@ cat >"$T/hook" <<H
 printf '%s|%s|%s|%s|%s\n' "\$1" "\$2" "\$LASTREAD_EVENT" "\$LASTREAD_NAME" "\$LASTREAD_DIR" >"$T/hook.out"
 H
 chmod +x "$T/hook"
-event_cmd="$T/hook" name=disk1 dir=/data LOG="" map=""
+event_cmd="$T/hook" name=example dir=/data LOG="" map=""
 notify hot "too hot: 49"
 for _ in $(seq 1 50); do [[ -s $T/hook.out ]] && break; sleep 0.1; done
-eq "notify: arguments and environment" "hot|too hot: 49|hot|disk1|/data" "$(cat "$T/hook.out")"
+eq "notify: arguments and environment" "hot|too hot: 49|hot|example|/data" "$(cat "$T/hook.out")"
 event_cmd=""
 rm -f "$T/hook.out"
 notify hot "x"

@@ -47,10 +47,10 @@ check "the image has the real data everywhere" cmp -s "$clean" "$D/heal.img"
 eq "nothing is left as unreadable in the map" 0 "$(decmap "$D/heal.map" | awk '$3 == "-" {s += $2} END {print s + 0}')"
 
 # --- a disk that keeps answering with the same garbage
-disk2="$(dm_create stuck "$(dm_linear "$loop_stuck" 0 $SIZE)")"
+disk_stuck="$(dm_create stuck "$(dm_linear "$loop_stuck" 0 $SIZE)")"
 D="$W/stays"
 mkdir -p "$D"
-tool "$disk2" --dir "$D" --name stays "${opts[@]}"
+tool "$disk_stuck" --dir "$D" --name stays "${opts[@]}"
 rc_is "a disk that keeps the garbage: the run finishes" 0
 check "what still looks like garbage is reported" out_has "after the new read 2 places"
 eq "...and recorded" $'6291456 6292480\n20975616 20976128' "$(cat "$D/stays.logs/garbage-ranges.txt")"
@@ -68,7 +68,7 @@ check "...nothing found" out_has "garbage check: nothing found"
 # --- not requested: no scan
 D="$W/off"
 mkdir -p "$D"
-tool "$disk2" --dir "$D" --name off --interval 1 --no-temp --no-fs
+tool "$disk_stuck" --dir "$D" --name off --interval 1 --no-temp --no-fs
 check "without --recheck-garbage there is no scan" bash -c "! grep -F 'garbage check' '$OUT' >/dev/null"
 
 finish
