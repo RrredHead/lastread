@@ -416,6 +416,13 @@ tests/vm.sh integration       # device-mapper, scsi_debug, NTFS, ext4, FAT32 and
 ```
 
 The integration tests create and destroy block devices: run them in a VM, never on a machine whose disks matter.
+GitHub Actions runs **Quick checks** on pushes to `main` and pull requests: lint, then unit tests with mawk and
+gawk, excluding the timing-sensitive triage and callback tests. The longer **Integration tests (manual)** workflow runs only when started from the Actions tab (choose a branch
+and click **Run workflow**) or with `gh workflow run integration.yml --ref BRANCH`. It runs each integration area as
+a named stage, also runs those timing-sensitive unit tests, and stops subsequent stages after a failure. Check the job summary for skipped checks: a green run with
+skips is not full coverage. GitHub-hosted runners may lack kernel modules or file-system support; run the full suite in
+the Multipass VM above when needed. The manual workflow becomes available after its file is on the default branch.
+
 `docs/feature-matrix.md` maps every feature to its code and its test.
 
 ## Credits

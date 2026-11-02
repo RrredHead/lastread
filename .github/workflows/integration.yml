@@ -1,0 +1,71 @@
+name: Integration tests (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: Disk recovery integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out selected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install disk and file-system tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs exfatprogs dosfstools smartmontools whiptail gawk
+      - name: Prepare optional SCSI simulator
+        run: |
+          if ! modprobe -n scsi_debug 2>/dev/null; then
+            sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" || \
+              echo '::warning::Kernel modules are unavailable; scsi_debug tests may be skipped.'
+          fi
+      - name: Check timeouts and event callbacks with mawk
+        run: |
+          sudo update-alternatives --set awk /usr/bin/mawk
+          tests/unit/run.sh test_triage test_service |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Check timeouts and event callbacks with gawk
+        run: |
+          sudo update-alternatives --set awk /usr/bin/gawk
+          tests/unit/run.sh test_triage test_service |& tee -a "$RUNNER_TEMP/integration.log"
+          sudo update-alternatives --set awk /usr/bin/mawk
+      # Each stage stops the following tests on failure. The final summary still runs, so a
+      # capability-related skip is visible rather than silently counting as full coverage.
+      - name: Image disks and resume interrupted work
+        run: sudo tests/integration/run.sh test_dm_phases |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Recover ext, FAT and exFAT files
+        run: sudo tests/integration/run.sh test_fs |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Detect and reread silent garbage
+        run: sudo tests/integration/run.sh test_garbage |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Defer and narrow hanging regions
+        run: sudo tests/integration/run.sh test_hang_zones |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Recover NTFS files and metadata
+        run: sudo tests/integration/run.sh test_ntfs |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Check device and resume safeguards
+        run: sudo tests/integration/run.sh test_safety |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Recover dropped SCSI disks and test 4 KiB sectors
+        run: sudo tests/integration/run.sh test_scsi_debug |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Diagnose disks before recovery
+        run: sudo tests/integration/run.sh test_triage |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Pause and resume on temperature changes
+        run: sudo tests/integration/run.sh test_watchdog |& tee -a "$RUNNER_TEMP/integration.log"
+      - name: Summarize skipped checks
+        if: always()
+        run: |
+          echo '### Integration test coverage' >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RUNNER_TEMP/integration.log" ]] && grep '^skip  ' "$RUNNER_TEMP/integration.log" > "$RUNNER_TEMP/integration-skips"; then
+            echo 'Some checks were skipped because this runner lacks a capability:' >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat "$RUNNER_TEMP/integration-skips" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            echo '::warning::Some integration checks were skipped; see the job summary.'
+          else
+            echo 'No skip lines were reported by the tests that ran. Check earlier stages for failures or stages that did not run.' >> "$GITHUB_STEP_SUMMARY"
+          fi

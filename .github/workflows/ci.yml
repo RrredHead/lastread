@@ -1,4 +1,4 @@
-name: CI
+name: Quick checks
 
 on:
   push:
@@ -9,40 +9,38 @@ permissions:
   contents: read
 
 jobs:
-  lint-and-unit:
+  quick-checks:
+    name: Static analysis and unit tests
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install dependencies
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install test dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q shellcheck gddrescue jq sleuthkit gawk
-      - name: Lint (ShellCheck and style rules)
+      - name: Check shell scripts and project rules
         run: tests/lint.sh
-      - name: Unit tests with mawk (the default awk of Ubuntu)
+      - name: Test with mawk
         run: |
           sudo update-alternatives --set awk /usr/bin/mawk
-          tests/unit/run.sh
-      - name: Unit tests with gawk
+          tests=()
+          for test in tests/unit/test_*.sh; do
+            case ${test##*/} in
+              test_service.sh | test_triage.sh) continue ;; # timing and asynchronous callbacks
+            esac
+            tests+=("${test##*/}")
+          done
+          tests/unit/run.sh "${tests[@]}"
+      - name: Test with gawk
         run: |
           sudo update-alternatives --set awk /usr/bin/gawk
-          tests/unit/run.sh
-
-  # The integration tests create loop and device-mapper devices and mount NTFS through FUSE.
-  # A hosted runner may not allow all of that (scsi_debug needs linux-modules-extra and is skipped
-  # when missing). The job does not block merges: if it cannot run here, run the same tests in a VM
-  # with tests/vm.sh (see the README).
-  integration:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs exfatprogs dosfstools smartmontools whiptail
-          sudo apt-get install -y -q "linux-modules-extra-$(uname -r)" || echo "no linux-modules-extra: scsi_debug tests will be skipped"
-      - name: Integration tests
-        run: sudo tests/integration/run.sh
+          tests=()
+          for test in tests/unit/test_*.sh; do
+            case ${test##*/} in
+              test_service.sh | test_triage.sh) continue ;; # timing and asynchronous callbacks
+            esac
+            tests+=("${test##*/}")
+          done
+          tests/unit/run.sh "${tests[@]}"
