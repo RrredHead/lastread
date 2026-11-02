@@ -209,7 +209,10 @@ check "D: ...lists nothing new (the list is only appended to)" bash -c "! grep -
 # === D2. an image shorter than the partition (the rescue has not reached the end yet) ======================
 D="$W/short"
 mkdir -p "$D"
-cp "$W/a/vol.map" "$D/short.map"
+mkmap "$D/short.map" <<M
+0 $((40 * M)) +
+$((40 * M)) $((SIZE - 40 * M)) ?
+M
 head -c $((40 * M)) "$W/a/vol.img" >"$D/short.img"
 tool --inventory --dir "$D" --name short
 rc_is "D2: an inventory of an image that ends early works" 0

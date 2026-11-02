@@ -1,7 +1,7 @@
 # lastread
 
 `lastread` images a failing disk or partition with [GNU ddrescue](https://www.gnu.org/software/ddrescue/)
-**without killing it**, and then recovers files from the image. The failing disk is only ever read.
+while trying to reduce stress on it, and then recovers files from the image. The failing disk is only ever read.
 
 It is one bash script around `ddrescue`. What it adds:
 
@@ -24,8 +24,9 @@ It is one bash script around `ddrescue`. What it adds:
   touching the disk, also as JSON), `--on-event` (a program is run when the disk gets hot, drops, needs a power cycle,
   …) and `--print-service` (a systemd unit that continues the rescue by itself after a power cycle).
 
-It does not repair anything and never writes to the source device; while rescuing it also sets the kernel's
-read-only flag on the source, so nothing else on the machine can modify the failing disk.
+It does not repair anything and does not intentionally write to the source device. During rescue it attempts to set
+the kernel's read-only flag as an additional safeguard; if that fails, it warns and continues without it. No software
+can guarantee that further reads will not worsen a failing drive.
 
 ## When not to use it
 
@@ -87,6 +88,8 @@ To update a copy that is *running* a rescue, write the new version to a temporar
    ```bash
    sudo lastread /dev/disk/by-id/ata-EXAMPLE_DISK-part1 --triage
    ```
+
+   Triage performs real reads, which can stress a failing disk; skip it if those reads are not worth the risk.
 
    It prints the identity, SMART data (if the disk shows it), kernel messages about the disk and nine one-megabyte
    sample reads, then a verdict — green, yellow or red — and suggested options. Red means the disk barely answers:
@@ -187,6 +190,20 @@ PROGRAM` (default from `$LASTREAD_ON_EVENT`), `--print-service`.
 **General** — `--dry-run`, `--help`, `--version`.
 
 Sizes accept `k`/`M`/`G`/`T` (powers of 1000) and `Ki`/`Mi`/`Gi`/`Ti` (powers of 1024).
+
+## Resume safety
+
+Keep the image and map together: a map without its image, or an image shorter than rescued ranges, is refused.
+This cannot detect an image replaced by another file of the same size or sparse holes. On the first run lastread
+records available device identifiers and partition geometry in `NAME.logs/source.identity` and checks them on resume
+and after a reconnect. If the identity changes or cannot be read, it stops; after independently verifying the source,
+`--accept-source-change` adopts the new identity on the next run; remove the option afterwards, including from any
+systemd unit, so later changes are checked. Older rescues without an identity record are adopted
+with a warning. If no stable identifier is available, a warning explains that identity cannot be reliably checked.
+
+lastread compares available block-device ancestry of the source and destination, including device-mapper and RAID.
+When ancestry cannot be determined, or a multi-device filesystem such as btrfs is involved, it warns: independently
+ensure every destination is on a different physical disk. These checks are safeguards, not proof.
 
 ## Recipes
 
@@ -352,9 +369,9 @@ damaged: run the same command with `--give-up-zones`.
   `kernel-parameters.txt` for the syntax). Remove it afterwards.
 - **Cold power-off:** if a disk drops and does not come back by rescanning, do a full power-off (not a reboot),
   wait, power on and run the same command again (or let `--print-service` do the last step).
-- **The read-only flag.** While rescuing, the source is read-only for the kernel (`blockdev --setro`): a mount, an
-  `fsck` or a write by mistake fails instead of altering the failing disk. The old value is restored on exit; a disk
-  that comes back under a new name gets the flag again. `--no-readonly` turns it off.
+- **The read-only flag.** lastread attempts to set `blockdev --setro` as an additional kernel safeguard against
+  accidental writes. If it cannot, it warns and continues unprotected. The old value is restored on normal cleanup;
+  the flag is set again on a returning device. `--no-readonly` disables it.
 - **Silent garbage.** Some failing disks return something else instead of data and report no error, so ddrescue
   counts the place as read. Extraction checks the data stream and lists such files in `suspicious-files.txt`
   (they are still extracted): a 512-byte service sector tagged `sEDU` at both ends (seen on a failing 2.5" SMR drive)

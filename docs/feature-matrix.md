@@ -27,7 +27,8 @@ Every feature, the code that implements it (function names in `lastread`) and th
 | Kernel command timeout 180 s while rescuing, restored on exit | `main` (`orig_timeout`), `cleanup`, `recover_device` | I: `test_scsi_debug` |
 | `systemd-inhibit` while running (if available) | `main` | I: `test_dm_phases` |
 | `flock` against a second run | `main` (fd 8) | I: `test_safety` |
-| Checks: source not mounted, image directory not on the same disk, enough room | `preflight_device` | I: `test_dm_phases` (mounted), `test_safety` (same disk, no room) |
+| Checks: source not mounted, shared block ancestry of destinations, enough room | `preflight_device`, `check_destination` | U: `test_resume_safety` (multi-device ancestry and unknown topology); I: `test_dm_phases` (mounted), `test_safety` (same disk, no room) |
+| Resume safety: image covers rescued ranges; source identifiers and partition geometry checked on resume and reconnect | `validate_image_map`, `source_identity`, `identity_check`, `identity_prepare`, `recover_device` | U: `test_resume_safety`; I: `test_safety` |
 | `--dry-run` | `main` | I: `test_dm_phases`, `test_safety` |
 | Logs: run log, ddrescue events and rates, ddrescue output per phase | `note`, `run_ddrescue` | I: `test_dm_phases` |
 

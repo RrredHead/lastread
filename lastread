@@ -47,6 +47,7 @@ verify=0 extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
 extract_to="" includes=() maps=() owner="" file_mode=0664 dir_mode=0775
 suspect_patterns=() suspect_zeros=$((128 * 1024)) suspect_check=1
 DRY_RUN=0
+accept_source_change=0               # explicitly adopt a changed source identity
 readonly_flag=1                       # set the kernel read-only flag on the source while rescuing
 event_cmd=${LASTREAD_ON_EVENT:-}      # program run on events (--on-event)
 print_service=0                       # print a systemd unit for the command line and exit
@@ -142,6 +143,7 @@ Files and layout:
   --dir DIR            directory for NAME.img, NAME.map and NAME.logs/ [current directory];
                        must exist and must not be on the failing disk
   --name NAME          base name of the image files [base name of SOURCE]
+  --accept-source-change  adopt a changed source identity after checking it is the same disk
 
 Watchdog:
   --stop C             stop ddrescue at this temperature, °C [48]
@@ -347,6 +349,7 @@ parse_args() {
       --no-meta-first) meta_first=0 ;;
       --no-suspect-check) suspect_check=0 ;;
       --no-readonly) readonly_flag=0 ;;
+      --accept-source-change) accept_source_change=1 ;;
       --print-service) print_service=1 ;;
       --status) status=1 ;;
       --triage) triage=1 ;;
@@ -516,6 +519,82 @@ resolve_device() {
   TRANSPORT="$(lsblk -dno TRAN "$whole" 2>/dev/null | head -1 | tr -d ' ')" || TRANSPORT=""
   SECTOR="$(blockdev --getss "$dev" 2>/dev/null)" || SECTOR=512
 }
+# Record identifiers without reading the disk contents. Partition start distinguishes equal-sized
+# partitions on the same disk. An empty hardware ID is not treated as proof of identity.
+source_identity() {
+  local wwn serial start="whole"
+  wwn="$(lsblk -dn -o WWN "$whole" 2>/dev/null | head -1 | xargs)" || wwn=""
+  serial="$(lsblk -dn -o SERIAL "$whole" 2>/dev/null | head -1 | xargs)" || serial=""
+  if [[ $dev != "$whole" ]]; then
+    start="$(cat "/sys/class/block/${dev##*/}/start" 2>/dev/null)" || start="unknown"
+  fi
+  printf 'size=%s\nsector=%s\nstart=%s\nwwn=%s\nserial=%s\n' "$PART_SIZE" "$SECTOR" "$start" "$wwn" "$serial"
+  if [[ -z $wwn && -z $serial && $source_arg == /dev/disk/by-id/* ]]; then
+    printf 'path=%s\n' "$source_arg"
+  fi
+}
+identity_check() {
+  local expected=$1 current=$2 key old new
+  [[ -f $expected ]] || return 0
+  for key in size sector start wwn serial path; do
+    old="$(sed -n "s/^$key=//p" "$expected")"
+    [[ -n $old ]] || continue
+    new="$(sed -n "s/^$key=//p" "$current")"
+    [[ $old == "$new" ]] || { warn "source identity changed or is unavailable: $key (was '$old', now '${new:-unavailable}')"; return 1; }
+  done
+}
+identity_prepare() {
+  source_identity >"$TMPD/source.identity"
+  if [[ -f $logs/source.identity ]]; then
+    if ! identity_check "$logs/source.identity" "$TMPD/source.identity"; then
+      ((accept_source_change)) || die "source identity does not match; verify the device, then use --accept-source-change to adopt it"
+      warn "adopting the changed source identity; make sure this is the same source"
+    fi
+  elif [[ -f $map ]]; then
+    warn "this existing rescue has no recorded source identity; verify the source before continuing"
+  fi
+  if grep -Fx 'start=unknown' "$TMPD/source.identity" >/dev/null; then
+    warn "partition start is unavailable; equal-sized partitions may not be distinguishable"
+  fi
+  if ! grep -E '^(wwn|serial|path)=.+' "$TMPD/source.identity" >/dev/null; then
+    warn "no stable source identifier is available; identity cannot be reliably checked on resume"
+  fi
+}
+# A map may claim data that no longer exists in a missing or truncated image.
+validate_image_map() {
+  local pos size state end=0
+  [[ -f $map ]] || return 0
+  [[ -f $img ]] || die "map exists but image is missing: $img; restore the matching image before continuing"
+  while read -r pos size state; do
+    [[ $state == + ]] || continue
+    ((pos + size <= end)) || end=$((pos + size))
+  done < <(awk '!/^#/ && ++n > 1' "$map")
+  (( $(stat -c %s "$img") >= end )) || die "image $img is shorter than the rescued data recorded in $map; restore the matching image"
+}
+# lsblk -s returns the device and all of its underlying devices, including every branch of DM/RAID.
+# Compare major:minor, not names, so aliases and bind mounts do not hide shared devices.
+check_destination() {
+  local target=$1 source_nodes target_nodes mm fstype target_dev
+  source_nodes="$(lsblk -s -n -r -o MAJ:MIN "$dev" 2>/dev/null | sort -u)" || source_nodes=""
+  mm="$(findmnt -n -o MAJ:MIN --target "$target" 2>/dev/null | head -1 | xargs)" || mm=""
+  fstype="$(findmnt -n -o FSTYPE --target "$target" 2>/dev/null | head -1 | xargs)" || fstype=""
+  target_dev="$(lsblk -n -r -p -o MAJ:MIN,NAME 2>/dev/null | awk -v mm="$mm" '$1 == mm {print $2; exit}')" || target_dev=""
+  target_nodes=""
+  if [[ -n $target_dev ]]; then
+    target_nodes="$(lsblk -s -n -r -o MAJ:MIN "$target_dev" 2>/dev/null | sort -u)" || target_nodes=""
+  fi
+  if [[ -z $source_nodes || -z $target_nodes ]]; then
+    warn "cannot determine the underlying disks for $target; verify it is not on the source disk"
+    return 0
+  fi
+  if comm -12 <(printf '%s\n' "$source_nodes") <(printf '%s\n' "$target_nodes") | grep . >/dev/null; then
+    die "$target is on the same disk as the source (shared underlying block device)"
+  fi
+  case $fstype in
+    btrfs | zfs | bcachefs) warn "cannot verify every member of $fstype at $target; check that no member is on the source disk" ;;
+  esac
+}
+
 # Why a host rescan cannot bring this disk back; empty if it can. Rescanning a SCSI host re-polls
 # the ports of a libata (SATA) or SAS host. It cannot revive a USB device (the USB layer has
 # dropped it) or an NVMe controller.
@@ -662,6 +741,13 @@ recover_device() {
   sleep "$rescan_pause"
   rescan_host "$SCSI_HOST" || return 1
   resolve_device
+  PART_SIZE="$(blockdev --getsize64 "$dev")" || return 1
+  source_identity >"$TMPD/recovered.identity"
+  if ! identity_check "$TMPD/source.identity" "$TMPD/recovered.identity"; then
+    # cleanup must not change the flags or timeout of a different device.
+    RO_SET=0 orig_timeout=""
+    die "returned device identity does not match the original source; stopped before reading"
+  fi
   raise_kernel_timeout
   device_ok || return 1
   set_readonly
@@ -2440,15 +2526,11 @@ restore_readonly() {
 
 # Mount, location and space checks before the first read.
 preflight_device() {
-  local mounted dir_disk need avail extract_disk
+  local mounted need avail
   mounted="$( (findmnt -n -o TARGET -S "$dev" || true; lsblk -nr -o MOUNTPOINTS "$dev" 2>/dev/null || true) | awk 'NF' | sort -u | paste -sd ' ')" || mounted=""
   [[ -z $mounted ]] || die "$dev is mounted ($mounted): the source must not be mounted while rescuing"
-  dir_disk="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE --target "$dir")" 2>/dev/null | head -1)" || dir_disk=""
-  [[ $dir_disk != "$parent" ]] || die "$dir is on the same disk as the source"
-  if [[ -n $extract_to ]]; then
-    extract_disk="$(lsblk -no PKNAME "$(findmnt -n -o SOURCE --target "$extract_to")" 2>/dev/null | head -1)" || extract_disk=""
-    [[ $extract_disk != "$parent" ]] || die "$extract_to is on the same disk as the source"
-  fi
+  check_destination "$dir"
+  [[ -z $extract_to ]] || check_destination "$extract_to"
   # Only ddrescue itself (-x), not any command that mentions the path of the map.
   if pgrep -a -x ddrescue | grep -F -- " $map" >/dev/null; then
     die "ddrescue is already running with the map $map: stop it (Ctrl+C) and run the command again"
@@ -2534,6 +2616,7 @@ main() {
     # Without the disk: the size of the partition is the end of the map.
     [[ -f $map && -f $img ]] || die "no image or map in $dir for \"$name\""
     PART_SIZE="$(map_size "$map")"
+    validate_image_map
     if [[ -f $logs/sector-size && "$(cat "$logs/sector-size")" =~ ^[0-9]+$ ]]; then SECTOR="$(cat "$logs/sector-size")"; fi
     if ((DRY_RUN)); then
       info "inventory of $img: $(status_short); dry-run: nothing is run"
@@ -2542,6 +2625,7 @@ main() {
     install -d -m 755 "$logs"
     exec 8>"$dir/.$name.lock"
     flock -n 8 || die "another run is in progress for \"$name\": stop it and run --inventory again"
+    validate_image_map
     note "inventory by the image without the disk: $(status_short)"
     if ((extract)); then setup_owner; fi
     inventory_run
@@ -2561,6 +2645,8 @@ main() {
     [[ "$(map_size "$map")" == "$PART_SIZE" ]] ||
       die "the map $map covers $(map_size "$map") bytes but $dev has $PART_SIZE: another disk? (--name picks another image)"
   fi
+  validate_image_map
+  identity_prepare
   preflight_device
   for z in "${add_zones[@]}"; do
     (($(parse_size "${z%%-*}") < PART_SIZE)) || die "--add-zone $z starts past the end of the device ($(gb "$PART_SIZE"))"
@@ -2585,6 +2671,11 @@ main() {
   install -d -m 755 "$logs"
   exec 8>"$dir/.$name.lock"
   flock -n 8 || die "another run is in progress for \"$name\""
+
+  validate_image_map
+  identity_prepare
+  cp "$TMPD/source.identity" "$logs/source.identity.new"
+  mv "$logs/source.identity.new" "$logs/source.identity"
 
   [[ -z $SCSI_HOST ]] || echo "$SCSI_HOST" >"$logs/scsi-host"
   echo "$SECTOR" >"$logs/sector-size"

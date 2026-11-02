@@ -132,6 +132,10 @@ eq "recover_device gives up after --rescan-attempts returns in a row" 0 "$?"
   sleep() { :; }
   rescan_host() { return 0; }
   resolve_device() { :; }
+  blockdev() { echo 123; }
+  source_identity() { echo identity; }
+  identity_check() { :; }
+  TMPD="$T"
   device_ok() { return 0; }
   SCSI_HOST=host3 TRANSPORT="" rescan=1 recoveries=0 rescan_attempts=3 rescan_pause=0 kernel_timeout=0 source_arg=/dev/null
   logs="" LOG=""

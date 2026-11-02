@@ -68,6 +68,32 @@ rc_is "an extraction directory on the same disk is refused" 1
 check "...with a clear message" out_has "is on the same disk as the source"
 umount "$W/samedisk"
 
+# === a saved map must remain paired with its image and source ====================================
+D="$W/resume-safety"
+mkdir -p "$D"
+common=(--dir "$D" --name resume --interval 1 --no-temp --no-fs)
+tool "$disk" "${common[@]}"
+rc_is "resume fixture is imaged" 0
+check "source identity is saved" test -s "$D/resume.logs/source.identity"
+mv "$D/resume.img" "$D/saved.img"
+tool "$disk" "${common[@]}"
+rc_is "a map without its image is refused" 1
+check "missing image is explained" out_has "image is missing"
+mv "$D/saved.img" "$D/resume.img"
+cp --sparse=always "$D/resume.img" "$D/saved.img"
+truncate -s $((SIZE - 512)) "$D/resume.img"
+tool "$disk" "${common[@]}"
+rc_is "a truncated image is refused" 1
+check "truncated image is explained" out_has "shorter than the rescued data"
+mv "$D/saved.img" "$D/resume.img"
+printf 'wwn=other-device\n' >>"$D/resume.logs/source.identity"
+tool "$disk" "${common[@]}"
+rc_is "a changed or missing identifier is refused" 1
+check "identity mismatch is explained" out_has "source identity does not match"
+tool "$disk" "${common[@]}" --accept-source-change
+rc_is "a verified identity can be adopted explicitly" 0
+check "the adopted identity replaces the previous one" bash -c "! grep -Fx 'wwn=other-device' '$D/resume.logs/source.identity' >/dev/null"
+
 # === the run lock: a second run for the same image is refused ===================================================
 slow="$(dm_create slow "$(dm_delay "$loop" 0 $SIZE 30)")"
 D="$W/d"
