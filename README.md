@@ -28,6 +28,15 @@ It does not repair anything and does not intentionally write to the source devic
 the kernel's read-only flag as an additional safeguard; if that fails, it warns and continues without it. No software
 can guarantee that further reads will not worsen a failing drive.
 
+## Disclaimer
+
+**Use lastread at your own risk.** Reading a failing device can make its condition worse, and recovery may be
+incomplete or produce incorrect data. The program is provided **as is, without warranty**, including any warranty
+that data will be recovered or that a device will remain usable. To the extent permitted by applicable law, the
+authors and contributors are not liable for loss or corruption of data, damage to a device, interruption of service,
+or other losses arising from use of the program. See sections 15–17 of [GPL-3.0-or-later](LICENSE) for the governing
+warranty disclaimer and limitation of liability.
+
 ## When not to use it
 
 Do not use this on a disk whose data is valuable and whose failure looks mechanical. **Send it to a data
