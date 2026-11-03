@@ -449,6 +449,8 @@ GitHub Actions запускает **Quick checks** при push в `main` и дл
 
 ## Благодарности
 
+Developed with assistance from Claude and OpenAI Codex
+
 Построено на GNU ddrescue и The Sleuth Kit; они только вызываются как отдельные программы.
 
 ## Лицензия

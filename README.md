@@ -440,6 +440,8 @@ the Multipass VM above when needed. The manual workflow becomes available after 
 
 ## Credits
 
+Developed with assistance from Claude and OpenAI Codex
+
 Built on GNU ddrescue and The Sleuth Kit; it only calls them as programs.
 
 ## License
