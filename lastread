@@ -43,7 +43,7 @@ temp_cmd=${LASTREAD_TEMP_CMD:-} smart_type="" no_temp=0
 partition=""
 meta_first=1 firsts=()          # read the structures of the volume (and --first paths) before the rest
 recheck_garbage=0 GARBAGE_RE=""
-verify=0 extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
+verify=0 overwrite=0 extract=0 extract_damaged=0 inventory=0 pick=0 file_patterns=() no_fs=0
 extract_to="" includes=() maps=() owner="" file_mode=0664 dir_mode=0775
 suspect_patterns=() suspect_zeros=$((128 * 1024)) suspect_check=1
 DRY_RUN=0
@@ -191,11 +191,11 @@ File level (NTFS, ext2/3/4, FAT and exFAT; needs The Sleuth Kit; the image is ne
   --extract-damaged    in a normal run, extract the damaged files too (their unreadable parts are
                        zeros); a later run skips such a file because size and time match, so
                        delete it before recovering it again
-  --verify             check every extracted file: it is synced, dropped from the cache, read back and
+  --overwrite          replace conflicting regular files during extraction
+  --verify             check every extracted file: it is synced, advised out of cache, read back and
                        compared by SHA-256 with what the image gave; hashes go to NAME.logs/manifest.sha256
                        (sha256sum -c format, paths relative to --extract-to). Files already in place are
-                       checked too, against the manifest or else against the image: a copy whose write
-                       was cut short is found and extracted again
+                       checked too against the image; use --overwrite to replace a differing copy
   --extract-to DIR     where to extract; the tree of the volume is preserved
   --include PREFIX     extract only this path (a directory or a file) of the volume; repeatable
   --map SRC:DST        extract the volume path SRC (a directory or a file) into the directory DST
@@ -338,6 +338,7 @@ parse_args() {
       --extract) extract=1 ;;
       --extract-damaged) extract_damaged=1 ;;
       --verify) verify=1 ;;
+      --overwrite) overwrite=1 ;;
       --recheck-garbage) recheck_garbage=1 ;;
       --reverse) reverse=1 ;;
       --give-up-zones) give_up=1 ;;
@@ -431,6 +432,7 @@ validate_args() {
     die "--extract-to and --owner only make sense with --extract"
   fi
   ((!verify)) || ((extract)) || die "--verify only makes sense with --extract"
+  ((!overwrite)) || ((extract)) || die "--overwrite only makes sense with --extract"
   ((${#includes[@]} + ${#maps[@]} == 0)) || ((extract || inventory)) ||
     die "--include and --map only make sense with --extract or --inventory"
   local i
@@ -1439,6 +1441,7 @@ file_stream() {
 # Owner of extracted files: --owner, else the user who ran sudo, else root. Files are written as
 # that user (runuser), so a setgid directory passes its group on.
 setup_owner() {
+  command -v python3 >/dev/null || die "extracting safely needs Python 3"
   local user group=""
   RUN_AS=()
   if [[ -n $owner ]]; then
@@ -1485,86 +1488,212 @@ dest_for() {
   fi
   printf '%s/%s' "$extract_to" "$path"
 }
-make_dirs() {
-  local d=$1
-  [[ ! -d $d ]] || return 0
-  make_dirs "$(dirname "$d")"
-  "${RUN_AS[@]}" mkdir -m "$dir_mode" "$d"
+# The helper opens every directory relative to an already-open directory, never follows symbolic
+# links, and publishes a private temporary file atomically. It runs as the requested file owner.
+# Keep it in the script so installation still consists of one file.
+safe_extract_init() {
+  SAFE_EXTRACT_CODE="$(cat <<'PYCODE'
+import ctypes, errno, hashlib, os, secrets, stat, sys
+
+mode, root, rel, filemode, dirmode, epoch, expected, overwrite, verify = sys.argv[1:]
+parts = rel.split('/')
+if not parts or any(p in ('', '.', '..') for p in parts):
+    sys.exit('unsafe extraction path: ' + rel)
+flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+fd = None
+tmp = None
+tmpfd = None
+try:
+    fd = os.open(root, flags)
+    for part in parts[:-1]:
+        try:
+            child = os.open(part, flags, dir_fd=fd)
+        except FileNotFoundError:
+            if mode == 'inspect':
+                print('missing')
+                sys.exit(0)
+            try:
+                os.mkdir(part, int(dirmode, 8), dir_fd=fd)
+                child = os.open(part, flags, dir_fd=fd)
+                inherited = os.fstat(child).st_mode & stat.S_ISGID
+                os.fchmod(child, int(dirmode, 8) | inherited)
+            except FileExistsError:
+                child = os.open(part, flags, dir_fd=fd)
+        os.close(fd)
+        fd = child
+    name = parts[-1]
+    if mode == 'inspect':
+        try:
+            source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        except FileNotFoundError:
+            print('missing')
+            sys.exit(0)
+        try:
+            info = os.fstat(source)
+            if not stat.S_ISREG(info.st_mode):
+                sys.exit('destination is not a regular file: ' + rel)
+            digest = '-'
+            if verify == '1':
+                h = hashlib.sha256()
+                while True:
+                    chunk = os.read(source, 1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+                digest = h.hexdigest()
+            print('file', info.st_size, info.st_mtime_ns // 1000000000, digest)
+        finally:
+            os.close(source)
+        sys.exit(0)
+    # An exclusive, unpredictable name avoids collisions with existing .part files and links.
+    while True:
+        candidate = '.lastread-' + secrets.token_hex(16) + '.part'
+        try:
+            os.mkdir(candidate, 0o700, dir_fd=fd)
+            tmp = candidate
+            break
+        except FileExistsError:
+            continue
+    tmpfd = os.open(tmp, flags, dir_fd=fd)
+    tmpstat = os.fstat(tmpfd)
+    if tmpstat.st_uid != os.geteuid() or tmpstat.st_mode & 0o022:
+        sys.exit('temporary directory is not safely owned and protected: ' + rel)
+    out = os.open('data', os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=tmpfd)
+    h = hashlib.sha256()
+    total = 0
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(1024 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            h.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(out, view)
+                if not written:
+                    raise OSError('short write')
+                view = view[written:]
+            sys.stdout.buffer.write(chunk)
+        sys.stdout.buffer.flush()
+        if total != int(expected):
+            sys.exit('stream size does not match the image: ' + rel)
+        os.fchmod(out, int(filemode, 8))
+        seconds, _, nanos = epoch.partition(':')
+        timestamp_ns = int(seconds) * 1000000000 + int(nanos or 0)
+        os.utime(out, ns=(timestamp_ns, timestamp_ns))
+        if verify == '1':
+            os.fsync(out)
+            if hasattr(os, 'posix_fadvise'):
+                try:
+                    os.posix_fadvise(out, 0, 0, os.POSIX_FADV_DONTNEED)
+                except OSError:
+                    pass
+            os.lseek(out, 0, os.SEEK_SET)
+            check = hashlib.sha256()
+            while True:
+                chunk = os.read(out, 1024 * 1024)
+                if not chunk:
+                    break
+                check.update(chunk)
+            if check.digest() != h.digest():
+                sys.exit('VERIFICATION FAILED: ' + rel)
+            os.write(3, (h.hexdigest() + '\n').encode())
+    finally:
+        os.close(out)
+    if overwrite == '1':
+        # Never follow or replace a symlink or a non-regular destination, even with --overwrite.
+        try:
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            if not stat.S_ISREG(info.st_mode):
+                sys.exit('destination is not a regular file: ' + rel)
+        except FileNotFoundError:
+            pass
+        os.replace('data', name, src_dir_fd=tmpfd, dst_dir_fd=fd)
+    else:
+        # renameat2(NOREPLACE) works on FAT as well as Unix filesystems and is atomic.
+        # Older kernels/libcs can fall back to link(), which also refuses an existing name.
+        rename = getattr(ctypes.CDLL(None, use_errno=True), 'renameat2', None)
+        unsupported = True
+        if rename is not None:
+            rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+            rename.restype = ctypes.c_int
+            if rename(tmpfd, b'data', fd, os.fsencode(name), 1) == 0:  # RENAME_NOREPLACE
+                unsupported = False
+            else:
+                error = ctypes.get_errno()
+                if error not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+                    raise OSError(error, os.strerror(error), rel)
+        if unsupported:
+            os.link('data', name, src_dir_fd=tmpfd, dst_dir_fd=fd, follow_symlinks=False)
+            os.unlink('data', dir_fd=tmpfd)
+except OSError as exc:
+    sys.exit('safe extraction refused ' + rel + ': ' + str(exc))
+finally:
+    if tmpfd is not None:
+        try:
+            os.unlink('data', dir_fd=tmpfd)
+        except FileNotFoundError:
+            pass
+        os.close(tmpfd)
+    if tmp is not None and fd is not None:
+        try:
+            os.rmdir(tmp, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+    if fd is not None:
+        os.close(fd)
+PYCODE
+)"
 }
-# Extracts the files of a classify table into --extract-to (with only_intact=1 — only intact ones).
-# A file already extracted with the same size and time is skipped, so extraction can be
-# interrupted. Data is checked against SUSPECT_RE on the way; such files are extracted but go to
-# the list of suspicious files — better downloaded again. Size and mtime alone do not catch
-# corruption if the writes were cut short (for example a USB bridge without FUA): after an abrupt
-# disconnect of the target, check the last files written (see README).
+safe_extract() {
+  "${RUN_AS[@]}" python3 -c "$SAFE_EXTRACT_CODE" "$1" "$extract_to" "$2" "$file_mode" "$dir_mode" "${3:-0}" "${4:-0}" "$overwrite" "$verify"
+}
 check_suspect() {
   if [[ -n $SUSPECT_RE ]]; then grep -c -aP "$SUSPECT_RE"; else cat >/dev/null; fi
 }
-# write_stream FMAP ID DST: the file to DST.part as the owner; prints the number of suspicious
-# "lines" of the data. With --verify the SHA-256 of the stream goes to $STREAM_SHA.
-write_stream() {
-  if ((verify)); then
-    rm -f "$STREAM_SHA"
-    file_stream "$1" "$2" | tee >(sha256sum | cut -d' ' -f1 >"$STREAM_SHA") | "${RUN_AS[@]}" tee "$3.part" | check_suspect
-  else
-    file_stream "$1" "$2" | "${RUN_AS[@]}" tee "$3.part" | check_suspect
-  fi
-}
-# The hash of the stream written by write_stream (the hashing process finishes a moment after the pipe).
-stream_hash() {
-  local i
-  for i in $(seq 1 300); do
-    [[ -s $STREAM_SHA ]] && break
-    sleep 0.1
-  done
-  cat "$STREAM_SHA" 2>/dev/null || true
-}
-# verify_file FILE HASH: what is on the target, not in its cache: sync, drop the cached pages, read the
-# file back and compare. Succeeds if the SHA-256 is HASH.
-verify_file() {
-  local got
-  sync -- "$1" 2>/dev/null || sync
-  dd if="$1" iflag=nocache count=0 status=none 2>/dev/null || true
-  got="$(sha256sum -- "$1" | cut -d' ' -f1)"
-  [[ $got == "$2" ]]
-}
-# The last hash recorded in the manifest for a path relative to --extract-to.
-manifest_hash() {
-  [[ -f $MANIFEST ]] || return 0
-  RELP="$1" awk '{ if (substr($0, 67) == ENVIRON["RELP"]) h = substr($0, 1, 64) } END { print h }' "$MANIFEST"
-}
+# Propagate read and write errors; grep's status 1 means only that no suspicious bytes matched.
+write_stream() (
+  local fmap=$1 id=$2 rel=$3 epoch=$4 size=$5
+  local -a statuses
+  set +e
+  file_stream "$fmap" "$id" | safe_extract write "$rel" "$epoch" "$size" 3>"$STREAM_SHA" | check_suspect
+  statuses=("${PIPESTATUS[@]}")
+  ((statuses[0] == 0 && statuses[1] == 0 && statuses[2] < 2))
+)
 manifest_add() { printf '%s  %s\n' "$1" "$2" >>"$MANIFEST"; }
-# --verify for a file that is already in place (same size and time): True if it is what the image
-# gives. The reference is the manifest; without an entry it is computed from the image.
-existing_ok() {
-  local dst=$1 rel=$2 id=$3 want fmap
-  want="$(manifest_hash "$rel")"
-  if [[ -z $want ]]; then
-    fmap="$(file_map "${id%%-*}")" || return 1
-    want="$(file_stream "$fmap" "$id" | sha256sum | cut -d' ' -f1)"
-    verify_file "$dst" "$want" || return 1
-    manifest_add "$want" "$rel"
-    return 0
-  fi
-  verify_file "$dst" "$want"
-}
 extract_files() {
-  local tsv=$1 only_intact=$2 state id size mt path dst epoch fmap kind suspect rel got copied=0 skipped=0 verified=0 failed=0
-  local suspicious="$logs/suspicious-files.txt"
+  local tsv=$1 only_intact=$2 state id size mt path dst epoch nanos fmap kind suspect rel got existing ex_kind ex_size ex_time ex_hash want
+  local copied=0 skipped=0 verified=0 suspicious="$logs/suspicious-files.txt"
+  command -v python3 >/dev/null || die "extracting safely needs Python 3"
+  safe_extract_init
+  [[ -n $STREAM_SHA ]] || STREAM_SHA="$TMPD/stream.sha"
   touch "$suspicious"
   while IFS=$'\t' read -r state id size mt path _; do
     ((!only_intact)) || [[ $state == intact ]] || continue
     [[ -n $size && -n $mt ]] || continue
     dst="$(dest_for "$path")"
     [[ -n $dst ]] || continue
-    epoch="$(date -d "$mt UTC" +%s)"
+    read -r epoch nanos < <(date -d "$mt UTC" '+%s %N')
     rel="${dst#"$extract_to"/}"
-    if [[ -f $dst && "$(stat -c '%s %Y' "$dst")" == "$size $epoch" ]]; then
-      if ((!verify)) || existing_ok "$dst" "$rel" "$id"; then
-        skipped=$((skipped + 1))
-        continue
+    existing="$(safe_extract inspect "$rel")" || die "cannot safely inspect destination: $rel"
+    read -r ex_kind ex_size ex_time ex_hash <<<"$existing"
+    if [[ $ex_kind == file ]]; then
+      if [[ $ex_size == "$size" && $ex_time == "$epoch" ]]; then
+        if ((!verify)); then
+          skipped=$((skipped + 1))
+          continue
+        fi
+        fmap="$(file_map "${id%%-*}")" || die "the entry ${id%%-*} of the file system is unreadable: $path"
+        want="$(file_stream "$fmap" "$id" | sha256sum | cut -d' ' -f1)" || die "cannot read image data for $path"
+        if [[ $want == "$ex_hash" ]]; then
+          manifest_add "$want" "$rel"
+          skipped=$((skipped + 1))
+          continue
+        fi
       fi
-      note "  $rel is not what the image gives (it changed after it was extracted): extracting it again"
+      ((overwrite)) || die "destination already exists: $rel; use --overwrite to replace it"
+      note "  replacing existing file: $rel"
     fi
     fmap="$(file_map "${id%%-*}")" || die "the entry ${id%%-*} of the file system is unreadable: $path"
     read -r _ _ kind _ <<<"$fmap"
@@ -1573,25 +1702,12 @@ extract_files() {
       continue
     fi
     log "  → $path ($(numfmt --to=si "$size")B)"
-    make_dirs "$(dirname "$dst")"
-    # The exit status does not matter (grep without a match returns 1): the size check below
-    # proves the copy is complete.
-    suspect="$(write_stream "$fmap" "$id" "$dst")" || true
-    [[ "$(stat -c %s "$dst.part" 2>/dev/null)" == "$size" ]] ||
-      die "the size of $dst.part does not match the image ($size): run the command again"
-    # shellcheck disable=SC2016 # $1, $2, $3 are expanded by the inner sh
-    "${RUN_AS[@]}" sh -c 'mv "$1.part" "$1" && chmod "$3" "$1" && touch -d "$2 UTC" "$1"' _ "$dst" "$mt" "$file_mode"
+    suspect="$(write_stream "$fmap" "$id" "$rel" "$epoch:$nanos" "$size")" || die "failed to extract $path safely"
     if ((verify)); then
-      got="$(stream_hash)"
-      if [[ -n $got ]] && verify_file "$dst" "$got"; then
-        manifest_add "$got" "$rel"
-        verified=$((verified + 1))
-      else
-        note "  VERIFICATION FAILED, the copy was removed: $path"
-        rm -f -- "$dst"
-        failed=$((failed + 1))
-        continue
-      fi
+      got="$(cat "$STREAM_SHA")"
+      [[ -n $got ]] || die "verification did not produce a hash for $path"
+      manifest_add "$got" "$rel"
+      verified=$((verified + 1))
     fi
     if ((${suspect:-0})); then
       note "  suspicious data inside (garbage from the disk or a long run of zeros) — better download again"
@@ -1602,8 +1718,7 @@ extract_files() {
   sort -u -o "$suspicious" "$suspicious"
   note "extracted files: $copied, already in place: $skipped"
   if ((verify)); then
-    note "verified by SHA-256: $verified new files (manifest: $MANIFEST), failed: $failed"
-    ((failed == 0)) || die "$failed files failed verification and were removed: run the command again"
+    note "verified by SHA-256: $verified new files (manifest: $MANIFEST), failed: 0"
   fi
   [[ ! -s $suspicious ]] || note "with suspicious data ($(wc -l <"$suspicious")) — download again: $suspicious"
 }

@@ -341,6 +341,7 @@ dd if="$img" bs=1 skip=409600 count=61340 status=none 2>/dev/null >"$T/a.expect"
 # cluster 100..114 is beyond the 400-cluster image? no: 100*4096 = 409600 < 1638400
 check "extract_files: the content equals the image data" cmp -s "$extract_to/movies/a.bin" "$T/a.expect"
 eq "extract_files: modification time comes from the volume" "$(date -d "$MT UTC" +%s)" "$(stat -c %Y "$extract_to/movies/a.bin")"
+eq "extract_files: subsecond modification time is preserved" 123456700 "$(stat -c %y "$extract_to/movies/a.bin" | cut -d. -f2 | cut -c1-9)"
 eq "extract_files: file mode" "664" "$(stat -c %a "$extract_to/movies/a.bin")"
 eq "extract_files: directory mode" "775" "$(stat -c %a "$extract_to/movies")"
 check "extract_files: no .part file is left" test ! -e "$extract_to/movies/a.bin.part"
@@ -382,8 +383,12 @@ verify=0
 extract_files "$T/files.tsv" 1 >/dev/null
 check "without --verify the changed copy goes unnoticed (size and time match)" bash -c "! cmp -s '$extract_to/movies/a.bin' '$T/a.expect'"
 verify=1
+( extract_files "$T/files.tsv" 1 ) >"$T/conflict.out" 2>&1
+eq "verification refuses to overwrite a changed file by default" 1 "$?"
+check "the changed file remains untouched" bash -c "! cmp -s '$extract_to/movies/a.bin' '$T/a.expect'"
+overwrite=1
 out="$(extract_files "$T/files.tsv" 1)"
-check "with --verify it is found" contains "$out" "extracting it again"
+check "with --verify and --overwrite it is found" contains "$out" "replacing existing file"
 check "...and extracted again, correctly" cmp -s "$extract_to/movies/a.bin" "$T/a.expect"
 # a file without a manifest entry is checked against the image
 grep -v ' movies/a.bin$' "$MANIFEST" >"$MANIFEST.new"
@@ -391,19 +396,53 @@ mv "$MANIFEST.new" "$MANIFEST"
 printf 'Z' | dd of="$extract_to/movies/a.bin" bs=1 seek=100 conv=notrunc status=none
 touch -d "@$epoch" "$extract_to/movies/a.bin"
 out="$(extract_files "$T/files.tsv" 1)"
-check "...also without a manifest entry (against the image)" contains "$out" "extracting it again"
+check "...also without a manifest entry (against the image)" contains "$out" "replacing existing file"
 check "...and corrected" cmp -s "$extract_to/movies/a.bin" "$T/a.expect"
-# a verification that fails: the copy is removed and the run fails
-# shellcheck disable=SC2317 # called indirectly by extract_files
-sha256sum() { if [[ ${1:-} == -- ]]; then echo "0000  $2"; else command sha256sum "$@"; fi; }
-rm -rf "${extract_to:?}"/*
-rm -f "$MANIFEST"
-( extract_files "$T/files.tsv" 1 ) >"$T/verify-fail.out" 2>&1
-eq "a failed verification fails the run" 1 "$?"
-check "...says so" contains "$(cat "$T/verify-fail.out")" "VERIFICATION FAILED"
-check "...and removes the copy" test ! -e "$extract_to/movies/a.bin"
-unset -f sha256sum
-verify=0
+# A failed stream must not publish a partial file or replace an existing destination.
+overwrite=1
+safe_extract_init
+printf 'keep me' >"$extract_to/protected"
+printf 'short' | safe_extract write protected 0 99 3>"$STREAM_SHA" >/dev/null 2>"$T/short.out"
+check "a short stream is rejected" test "$?" -ne 0
+eq "a short stream leaves the old file unchanged" 'keep me' "$(cat "$extract_to/protected")"
+check "a short stream leaves no temporary files" bash -c "! find '$extract_to' -name '.lastread-*.part' | grep . >/dev/null"
+overwrite=0 verify=0
+
+# Never follow a symlink in a directory, at the destination, or at the old predictable .part path.
+mkdir -p "$T/outside" "$extract_to/safe"
+printf 'outside data' >"$T/outside/victim"
+ln -s "$T/outside" "$extract_to/linkdir"
+refuse "a symlinked destination directory is refused" safe_extract inspect linkdir/victim
+printf 'data' | safe_extract write linkdir/victim 0 4 3>"$STREAM_SHA" >/dev/null 2>&1
+check "writing through a symlinked directory is refused" test "$?" -ne 0
+eq "symlinked directory target is untouched" 'outside data' "$(cat "$T/outside/victim")"
+ln -s "$T/outside/victim" "$extract_to/safe/file"
+refuse "a destination symlink is refused" safe_extract inspect safe/file
+overwrite=1
+printf 'data' | safe_extract write safe/file 0 4 3>"$STREAM_SHA" >/dev/null 2>&1
+check "overwrite refuses a destination symlink" test "$?" -ne 0
+eq "destination symlink target is untouched" 'outside data' "$(cat "$T/outside/victim")"
+overwrite=0
+ln -s "$T/outside/victim" "$extract_to/safe/new.part"
+printf 'data' | safe_extract write safe/new 0 4 3>"$STREAM_SHA" >/dev/null
+check "a pre-existing predictable .part link cannot affect extraction" test "$?" -eq 0
+eq "the old .part symlink target is untouched" 'outside data' "$(cat "$T/outside/victim")"
+eq "new file was extracted" data "$(cat "$extract_to/safe/new")"
+printf 'other' | safe_extract write safe/new 0 5 3>"$STREAM_SHA" >/dev/null 2>&1
+check "publication does not overwrite a newly existing file" test "$?" -ne 0
+eq "existing file is unchanged" data "$(cat "$extract_to/safe/new")"
+# Fractional timestamps before 1970 round down to the same second as GNU date/stat.
+touch -d '@-0.5' "$extract_to/safe/new"
+check "pre-epoch time is rounded down" contains "$(safe_extract inspect safe/new)" "file 4 -1 "
+
+# New nested directories must retain inherited setgid for their children.
+old_extract_to=$extract_to
+extract_to="$T/setgid-root"
+mkdir -p "$extract_to"
+chmod g+s "$extract_to"
+printf 'data' | safe_extract write nested/deeper/file 0 4 3>"$STREAM_SHA" >/dev/null
+check "setgid is inherited by created directories" test -g "$extract_to/nested/deeper"
+extract_to=$old_extract_to
 
 # --- dest_for --------------------------------------------------------------------------------------------
 extract_to=/out includes=() maps=()

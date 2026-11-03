@@ -89,9 +89,9 @@ printf 'Z' | dd of="$OUTV/media/movie1.mkv" bs=1 seek=12345 conv=notrunc status=
 touch -d "@$epoch" "$OUTV/media/movie1.mkv"
 tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root
 check "A: without --verify the changed copy is left (size and time match)" bash -c "! cmp -s '$REF/media/movie1.mkv' '$OUTV/media/movie1.mkv'"
-tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root --verify
-rc_is "A: with --verify the run repairs it" 0
-check "A: ...the changed copy was noticed" out_has "extracting it again"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTV" --owner root --verify --overwrite
+rc_is "A: with --verify and --overwrite the run repairs it" 0
+check "A: ...the changed copy was noticed" out_has "replacing existing file"
 check "A: ...and extracted again, byte for byte" cmp -s "$REF/media/movie1.mkv" "$OUTV/media/movie1.mkv"
 
 # --include / --map
@@ -102,6 +102,29 @@ rc_is "A: --include and --map" 0
 check "A: --include extracts the directory" cmp -s "$REF/media/sub/clip.bin" "$OUTI/media/sub/clip.bin"
 check "A: --map renames the destination" cmp -s "$REF/docs/notes/план.txt" "$OUTI/renamed/notes/план.txt"
 eq "A: nothing else is extracted" 2 "$(find "$OUTI" -type f | wc -l)"
+
+# Existing files and symlinks must not put unrelated data at risk.
+OUTSAFE="$W/outsafe"
+mkout "$OUTSAFE" "$OUTSAFE/media/sub" "$W/outside"
+printf 'existing data' >"$OUTSAFE/media/sub/clip.bin"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTSAFE" --owner root --include media/sub/clip.bin
+rc_is "A: a conflicting destination is refused" 1
+eq "A: the conflicting file is unchanged" 'existing data' "$(cat "$OUTSAFE/media/sub/clip.bin")"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTSAFE" --owner root --include media/sub/clip.bin --overwrite
+rc_is "A: explicit overwrite replaces a regular file" 0
+check "A: overwritten file equals the image" cmp -s "$REF/media/sub/clip.bin" "$OUTSAFE/media/sub/clip.bin"
+rm "$OUTSAFE/media/sub/clip.bin"
+printf 'outside data' >"$W/outside/victim"
+ln -s "$W/outside/victim" "$OUTSAFE/media/sub/clip.bin.part"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTSAFE" --owner root --include media/sub/clip.bin
+rc_is "A: an old predictable .part symlink is not used" 0
+eq "A: the symlink target is unchanged" 'outside data' "$(cat "$W/outside/victim")"
+check "A: the extracted file is correct despite the old symlink" cmp -s "$REF/media/sub/clip.bin" "$OUTSAFE/media/sub/clip.bin"
+rm "$OUTSAFE/media/sub/clip.bin"
+ln -s "$W/outside/victim" "$OUTSAFE/media/sub/clip.bin"
+tool --inventory --dir "$D" --name vol --extract --extract-to "$OUTSAFE" --owner root --include media/sub/clip.bin --overwrite
+rc_is "A: even --overwrite refuses a destination symlink" 1
+eq "A: the destination symlink target is unchanged" 'outside data' "$(cat "$W/outside/victim")"
 
 # === B. damaged files: unreadable areas inside two files =========================================================
 mapfile -t movie2_runs < <(ntfs_runs "$VOL" media/movie2.mkv)
@@ -327,7 +350,10 @@ mkdir -p "$D"
 "$TOOL" "$slowvol" --dir "$D" --name metavol --interval 1 --no-temp --first media/sub >"$W/g1.out" 2>&1 &
 pid=$!
 for _ in $(seq 1 240); do
-  grep -Fx media/sub "$D/metavol.logs/first.done" >/dev/null 2>&1 && break
+  if grep -Fx media/sub "$D/metavol.logs/first.done" >/dev/null 2>&1 &&
+    grep -F 'metadata first: finished' "$D/metavol.logs/rescue.log" >/dev/null 2>&1; then
+    break
+  fi
   sleep 0.5
 done
 kill -TERM "$pid"

@@ -281,17 +281,21 @@ them and marking it would send the disk to re-read gigabytes for nothing.
 
 ### Extraction
 
-- Files are written to `NAME.part` and renamed when the size matches the volume; the modification time is set from
-  the volume (`istat` times, UTC).
-- A destination with the same size and time is skipped, which makes extraction interruptible and repeatable.
-  Size and time alone do not catch a copy whose write was cut short (a USB bridge that loses data on a disconnect):
-  re-check the last files after such an event.
+- Python 3 opens each destination directory relative to an already-open directory with `O_NOFOLLOW`. Symlinks and
+  non-regular destination files are refused. A random temporary directory is checked for ownership and protection
+  against other users' writes; the file inside is created exclusively. This keeps existing paths and `.part` files
+  from being used as output and keeps the operation anchored to opened directories.
+- When the stream has the expected size, the temporary file receives its volume modification time (`istat`, UTC)
+  and is published atomically. Linux `renameat2` with `RENAME_NOREPLACE` prevents a destination created in the
+  meantime from being overwritten; where unavailable, an atomic hard-link operation is tried. With `--overwrite`,
+  an existing regular file may instead be replaced. Temporary files are removed on normal completion or failure.
+- A destination with the same size and time is skipped, which makes extraction interruptible and repeatable. Size
+  and time alone do not catch a copy whose write was cut short (a USB bridge that loses data on a disconnect).
 - Files are written as `--owner` (via `runuser`) so that a setgid directory passes its group on.
-- With `--verify` the stream is hashed on the way (`tee` into `sha256sum`), then the file on the target is synced
-  (`sync FILE`), dropped from the page cache (`dd iflag=nocache count=0`), read back and hashed; a difference removes
-  the copy and fails the run at the end. Hashes go to `manifest.sha256` (`HASH  PATH`, the format of
-  `sha256sum -c`); a file already in place with the same size and time is compared with its manifest entry, or with
-  a hash computed from the image when there is none.
+- With `--verify` the stream is hashed during the write, then the temporary file is synced, advised out of the page
+  cache and read back. A mismatch fails without replacing the destination. Hashes go to `manifest.sha256`
+  (`HASH  PATH`, the format of `sha256sum -c`); a file already in place with the same size and time is compared
+  with a hash computed from the image. A differing file is a conflict; `--overwrite` permits its replacement.
 
 ## Shell lessons built into the code
 

@@ -20,7 +20,7 @@ jobs:
       - name: Install disk and file-system tools
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs exfatprogs dosfstools smartmontools whiptail gawk
+          sudo apt-get install -y -q gddrescue jq sleuthkit ntfs-3g attr e2fsprogs exfatprogs dosfstools smartmontools whiptail gawk python3
       - name: Prepare optional SCSI simulator
         run: |
           if ! modprobe -n scsi_debug 2>/dev/null; then

@@ -19,7 +19,7 @@ jobs:
       - name: Install test dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q shellcheck gddrescue jq sleuthkit gawk
+          sudo apt-get install -y -q shellcheck gddrescue jq sleuthkit gawk python3
       - name: Check shell scripts and project rules
         run: tests/lint.sh
       - name: Test with mawk

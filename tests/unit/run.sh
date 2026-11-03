@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Runs every unit test (no root, no devices). Needs: bash, GNU ddrescue (ddrescuelog), jq, coreutils,
-# util-linux, grep with -P. Usage: tests/unit/run.sh [test_name...]
+# util-linux, grep with -P, python3. Usage: tests/unit/run.sh [test_name...]
 set -Eeuo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 failed=0

@@ -22,7 +22,7 @@ cmd_create() {
   vm sudo bash -c 'export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
     apt-get install -y -qq gddrescue smartmontools jq sleuthkit ntfs-3g whiptail dmsetup util-linux \
-      e2fsprogs attr exfatprogs dosfstools "linux-modules-extra-$(uname -r)"'
+      e2fsprogs attr exfatprogs dosfstools python3 "linux-modules-extra-$(uname -r)"'
 }
 cmd_sync() {
   tar --exclude=.git -C "$ROOT" -cf - . |

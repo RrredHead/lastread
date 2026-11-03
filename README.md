@@ -55,6 +55,7 @@ Also: never run `fsck`, `chkdsk`, `ntfsfix` or mount the source read-write. Do a
 | GNU coreutils (`numfmt`, `stat`, `truncate`, `dd`, …), `grep` with `-P`, awk (mawk or gawk) | 9.4, 3.11, mawk 1.3.4 / gawk 5.2 | everything |
 | smartmontools ≥ 7 (for `smartctl -j`) and jq | 7.4, 1.7 | the temperature watchdog (optional) |
 | The Sleuth Kit | 4.12 (4.12.1) | the file level (optional) |
+| Python 3 | 3.6 or later | safe extraction (only with `--extract`) |
 | whiptail | any | the `--pick` window (optional; plain questions without it) |
 | systemd (`systemd-inhibit`) | any | keeping the machine awake (optional) |
 
@@ -185,7 +186,7 @@ PROGRAM` (default from `$LASTREAD_ON_EVENT`), `--print-service`.
 **Silent garbage** — `--suspect-pattern RE` (repeatable), `--suspect-zeros SIZE` (128Ki), `--no-suspect-check`,
 `--recheck-garbage`.
 
-**Verification** — `--verify` (with `--extract`).
+**Verification** — `--verify` (with `--extract`); `--overwrite` explicitly replaces conflicting regular files.
 
 **General** — `--dry-run`, `--help`, `--version`.
 
@@ -341,9 +342,13 @@ The tree of the volume is preserved below `--extract-to`. `--include` keeps only
 puts a directory (or one file) into the directory `DST`; with either of them only matching files are extracted.
 Without them the whole volume is extracted — system folders such as `System Volume Information` and files such as
 `pagefile.sys` included — so use `--include` to pick what you need. With `--inventory`, `--include`/`--map` only
-choose the paths whose counts are printed (without them the counts are per top-level directory). Files are written as `NAME.part`
-and renamed when complete; the modification time comes from the volume. A file already extracted with the same size
-and time is skipped, so extraction can be interrupted and repeated.
+choose the paths whose counts are printed (without them the counts are per top-level directory). Files are written to
+private, uniquely named temporary files and published when complete; the modification time comes from the volume.
+Symbolic links in destination paths are refused; the destination must permit a temporary directory that other users
+cannot write. Existing files with the same size and time are skipped; other
+conflicts stop extraction without changing the existing file. Use `--overwrite` to replace conflicting regular files.
+With `--verify`, same-size, same-time files are checked against the image; a differing file is a conflict and needs
+`--overwrite` to replace it. Without `--verify`, the size and time check does not prove the contents match.
 
 By default only **intact** files are extracted. In a normal run, `--extract-damaged` also extracts damaged files,
 with the unreadable parts as zeros; later runs will skip such a file because its size and time match, so delete it
@@ -380,10 +385,9 @@ damaged: run the same command with `--give-up-zones`.
   Replace the pattern with `--suspect-pattern RE` (`grep -P`, bytes).
 - **Check the target after an abrupt disconnect.** Skipping "already extracted" files by size and time does not
   catch a file whose write was cut short (for example a USB bridge that drops data on a disconnect). Use
-  `--verify`: every extracted file is synced, dropped from the cache, read back and compared by SHA-256 with what
+  `--verify`: every extracted file is synced, advised out of cache, read back and compared by SHA-256 with what
   the image gave, the hashes go to `NAME.logs/manifest.sha256` (`cd TARGET && sha256sum -c MANIFEST` checks them
-  later, anywhere), and files that are already in place are checked the same way — against the manifest, or else
-  against the image — and extracted again if they differ.
+  later, anywhere), and files that are already in place are checked against the image and reported as conflicts if they differ. Add `--overwrite` to replace them.
 - **Run it in `tmux`/`screen`** and keep the image on a disk with free space for the entire device.
 - **The image is sparse** and grows as the disk is read; `truncate` is used to give it the size of the device.
 

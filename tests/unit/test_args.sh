@@ -55,6 +55,8 @@ refuse "--extract-to needs --extract" args_ok --extract-to /tmp /dev/null
 check "--extract with --extract-to" args_ok --extract --extract-to /tmp /dev/null
 check "--verify with --extract" args_ok --extract --extract-to /tmp --verify /dev/null
 refuse "--verify needs --extract" args_ok --verify /dev/null
+check "--overwrite with --extract" args_ok --extract --extract-to /tmp --overwrite /dev/null
+refuse "--overwrite needs --extract" args_ok --overwrite /dev/null
 refuse "--no-fs conflicts with --inventory" args_ok --no-fs --inventory
 refuse "--no-fs conflicts with --extract" args_ok --no-fs --extract --extract-to /tmp /dev/null
 refuse "--inventory conflicts with --pick" args_ok --inventory --pick

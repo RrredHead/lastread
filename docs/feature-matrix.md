@@ -70,7 +70,7 @@ Every feature, the code that implements it (function names in `lastread`) and th
 | Copy by pieces (`dd`); `icat` only for resident and compressed | `file_stream` | U: `test_tsk`; I: `test_ntfs` |
 | `--inventory`: lists of whole and incomplete files from the image, any stage; with `--extract` only the whole ones | `inventory_run` | I: `test_ntfs` |
 | `--file PART` (no questions) and `--pick` (window, plain questions) | `targeted_run`, `ui_checklist`, `write_ranges_domain`, `has_in` | U: `test_map` (domains); I: `test_ntfs` (`--file`, `--pick` through a pty) |
-| Extraction: `.part` + rename, size check, time from the volume, skip if present with the same size and time | `extract_files` | U: `test_tsk`; I: `test_ntfs` |
+| Extraction: descriptor-relative paths without symlinks, unique temporary files, no overwrite unless requested, size and time checks | `safe_extract`, `extract_files` | U: `test_tsk`; I: `test_ntfs` |
 | `--extract-to`, `--include`, `--map`, `--owner`, modes | `dest_for`, `setup_owner`, `make_dirs` | U: `test_args`, `test_tsk`, `test_watchdog`; I: `test_ntfs` |
 | Intact files only by default; `--extract-damaged` | `extract`, `extract_files` | U: `test_args`; I: `test_ntfs` |
 | Silent garbage: pattern, zero threshold, list of suspicious files | `validate_args` (pattern), `extract_files` | U: `test_args`, `test_suspect`, `test_tsk`; I: `test_ntfs` |
@@ -101,7 +101,7 @@ Every feature, the code that implements it (function names in `lastread`) and th
 | `--triage`: SMART, kernel log, sample reads, verdict, exit status 4 | `triage_run`, `triage_smart_json`, `triage_read`, `triage_positions` | U: `test_triage`; I: `test_triage` |
 | File level on a whole-disk image: partition detection, `--partition`, offsets, 4096-byte sectors | `fs_locate`, `tsk_set_offset`, offsets in `classify`, `file_stream`, `file_byte_ranges` | U: `test_partition`; I: `test_ntfs` (DOS, two NTFS, GPT 4Kn) |
 | Metadata first: boot sector geometry, `$MFT`, directory indexes, `--first`, zones kept out | `meta_run`, `ntfs_geometry`, `dir_index_ranges`, `rescue_ranges`, `subtract_ranges` | U: `test_meta`; I: `test_ntfs` (a slow disk interrupted after the phase; whole-disk image; no NTFS) |
-| `--verify` with a manifest; files in place checked; a failing verification removes the copy | `write_stream`, `verify_file`, `existing_ok`, `manifest_add` | U: `test_tsk`; I: `test_ntfs` |
+| `--verify` with a manifest; files in place checked against the image; a failing verification never publishes the copy | `write_stream`, `safe_extract`, `manifest_add` | U: `test_tsk`; I: `test_ntfs` |
 | `--recheck-garbage`: scan, mark as bad, read again, keep what stays | `scan_garbage`, `mark_map_ranges`, `garbage_run`, `unread_ranges` | U: `test_garbage`; I: `test_garbage`, `test_ntfs` |
 | The kernel timeout is only raised | `raise_kernel_timeout`, `main` | I: `test_scsi_debug` |
 | File level for ext2/3/4 (extents, holes, inline data), FAT12/16/32 and exFAT; boot-sector recognition of FAT/exFAT | `fs_kind_of`, `fs_probe`, `boot_probe`, `file_map_blocks`, `file_map_normalize`, rules in `tsk_files` | U: `test_fs_kinds` (real ext4 `istat -r`), `test_partition`; I: `test_fs` (ext4, FAT32, exFAT: healthy, damaged, whole-disk) |

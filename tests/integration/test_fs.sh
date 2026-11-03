@@ -105,6 +105,21 @@ fs_case fat32 70 512 vfat "iocharset=utf8" nosparse mkfs.vfat -F 32 -s 2 -S 512
 # exFAT (The Sleuth Kit's fsstat does not return on exFAT: the volume is recognised from its boot sector)
 fs_case exfat 64 512 exfat "" nosparse mkfs.exfat
 
+# A FAT destination does not support hard links; atomic no-replace must still work.
+if [[ -s $W/ext4-a/ext4.img ]]; then
+  truncate -s 70M "$W/fat-destination.img"
+  if mkfs.vfat -F 32 "$W/fat-destination.img" >/dev/null 2>&1 &&
+    mount -t vfat -o loop,iocharset=utf8 "$W/fat-destination.img" "$W/mnt-fat32" 2>/dev/null; then
+    printf '%s\n' "$W/mnt-fat32" >>"$W/registry-mounts"
+    tool --inventory --dir "$W/ext4-a" --name ext4 --extract --extract-to "$W/mnt-fat32" --owner root --include docs/readme.txt
+    rc_is "FAT destination: safe extraction succeeds without hard links" 0
+    check "FAT destination: extracted data is correct" cmp -s "$W/ref-ext4/docs/readme.txt" "$W/mnt-fat32/docs/readme.txt"
+    umount "$W/mnt-fat32"
+  else
+    skip "FAT destination cannot be mounted"
+  fi
+fi
+
 # an ext4 partition inside a whole-disk image
 if [[ -s $W/ext4.img ]]; then
   truncate -s 50M "$W/whole.img"
